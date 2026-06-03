@@ -220,10 +220,25 @@ const HORSE_FIELDS = [
   { key:"jockey",     label:"騎手", showInOutput:true },
 ];
 
+// ── 時間指数の基準タイムマスタ（競馬場-距離-馬場 → 基準秒） ──
+// 良馬場の基準値。稍重/重/不良は TRACK_OFFSET で補正する
+const TIME_BASE = {
+  // 東京
+  "東京-1600-良":93.0, "東京-1800-良":106.0, "東京-2000-良":118.5, "東京-2400-良":145.0,
+  // 中山
+  "中山-1600-良":93.5, "中山-1800-良":107.5, "中山-2000-良":120.0, "中山-2400-良":147.5,
+  // 阪神
+  "阪神-1600-良":93.2, "阪神-1800-良":106.8, "阪神-2000-良":119.0, "阪神-2400-良":146.0,
+};
+// 馬場による基準タイムの加算（秒）。重いほど時計がかかる＝基準を遅くする
+const TRACK_OFFSET = { "良":0.0, "稍重":0.8, "重":1.6, "不良":2.5 };
+
 // ── 各走で繰り返す指標プラグイン ──
-// type:"map"     → scoreMap の係数を引く（格・着順など離散値）
-// type:"linear"  → 数値を min..max で0..1正規化（タイム・上がりなど連続値）
-// ここに1ブロック足すだけで全機能に反映される
+// 入力サブ列は fields で定義（省略時は label 1列のみ）
+// type:"map"       → scoreMap の係数を引く（格・着順など離散値）
+// type:"linear"    → 数値を min..max で0..1正規化（連続値）
+// type:"timeindex" → 競馬場×距離×馬場の基準タイムとの差で採点
+// ここに1ブロック足すだけで入力列・計算・出力・設定すべてに反映される
 const METRICS = [
   {
     key:"grade", label:"格", type:"map",
@@ -236,7 +251,6 @@ const METRICS = [
       "毎日杯":0.952,"きさらぎ賞":0.940,"東スポ杯":0.932,"その他G3":0.932,
       "L/OP":0.920,"1勝クラス":0.908,"新馬・未勝利":0.900,"新馬":0.900,"未勝利":0.900,
     },
-    // 完全一致しない時のフォールバック
     fallback:(v)=>{
       if(/G3|GIII/.test(v)) return 0.932;
       if(/G2|GII/.test(v))  return 0.970;
@@ -253,16 +267,20 @@ const METRICS = [
     scoreMap:{ "1":1.000,"2":0.950,"3":0.900,"4":0.850,"5":0.800 },
     fallback:(v)=>{ const n=parseInt(v,10); return (!isNaN(n)&&n>=6)?0.750:null; },
   },
-
-  /* ── 例：タイム指標を追加したいときはコメントを外す ──
   {
-    key:"time", label:"タイム", type:"linear",
-    weight:0.5, showRunsInOutput:[1,2], none:["無",""],
-    // 秒に変換（"1:34.5" → 94.5）。速いほど高スコア
-    parse:(v)=>{ const m=v.match(/(\d+):(\d+\.\d+)/); return m? (+m[1])*60+(+m[2]) : (parseFloat(v)||null); },
-    min:90, max:130, invert:true,  // min(速)=1.0, max(遅)=0.0
+    key:"timeindex", label:"時間指数", type:"timeindex",
+    weight:0.8, showRunsInOutput:[1,2], none:["無",""],
+    // この指標は4つのサブ列を入力で要求する
+    fields:[
+      { key:"course",   label:"競馬場" },
+      { key:"distance", label:"距離"   },
+      { key:"cond",     label:"馬場"   },
+      { key:"time",     label:"タイム" },
+    ],
+    base:TIME_BASE, trackOffset:TRACK_OFFSET,
+    center:0.900,   // 基準タイムちょうどのスコア
+    perSec:0.040,   // 基準より1秒速いごとに +0.040、遅いごとに -0.040
   },
-  */
 ];
 
 // ── 走の設定 ──
@@ -288,16 +306,23 @@ const APP_CONFIG = {
 };
 
 /* ── 派生情報（CONFIGから自動計算。手で触らない） ── */
+// 各指標の入力サブ列を返す（fields未定義なら指標自身を1列扱い）
+function metricFields(m){
+  return m.fields || [{ key:m.key, label:m.label }];
+}
 const SCHEMA = (() => {
-  // CSV列の並び順を構築：固定フィールド → 各走(METRICS順)
+  // CSV列の並び順を構築：固定フィールド → 各走(METRICS順, 各指標のサブ列順)
   const csvCols = [];
   HORSE_FIELDS.forEach(f => csvCols.push({ label:f.label, key:f.key, kind:"horse" }));
   for(let r=0; r<RUNS.count; r++){
-    METRICS.forEach(m => csvCols.push({
-      label:`${RUNS.labels[r]}${m.label}`, metric:m.key, run:r, kind:"run"
-    }));
+    METRICS.forEach(m => {
+      metricFields(m).forEach(sf => csvCols.push({
+        label:`${RUNS.labels[r]}${sf.label}`, metric:m.key, sub:sf.key, run:r, kind:"run"
+      }));
+    });
   }
-  const fieldsPerRun = METRICS.length;
+  // 1走あたりの入力列数 = 全指標のサブ列の合計
+  const fieldsPerRun = METRICS.reduce((n,m)=>n+metricFields(m).length, 0);
   const fixedCount = HORSE_FIELDS.length;
   return { csvCols, fieldsPerRun, fixedCount };
 })();
@@ -395,7 +420,18 @@ const ModInput = (() => {
       for(let r=0;r<RUNS.count;r++){
         const base=SCHEMA.fixedCount+r*SCHEMA.fieldsPerRun;
         const run={};
-        METRICS.forEach((m,mi)=>run[m.key]=cols[base+mi]||null);
+        let off=0;
+        METRICS.forEach(m=>{
+          const sfs=metricFields(m);
+          if(sfs.length===1){
+            run[m.key]=cols[base+off]||null;  // 単一列：値をそのまま
+          }else{
+            const obj={};
+            sfs.forEach(sf=>{ obj[sf.key]=cols[base+off+ ( sfs.indexOf(sf) )]||null; });
+            run[m.key]=obj;                    // 複数列：オブジェクト
+          }
+          off+=sfs.length;
+        });
         horse.runs.push(run);
       }
       horses.push(horse);
@@ -407,13 +443,14 @@ const ModInput = (() => {
     document.getElementById("line-count").textContent="0頭分";
   }
   function _sample(){
+    // 列順: 馬番,馬名,騎手, 前走[格,着順,競馬場,距離,馬場,タイム], 2走前[同], 3走前[格,着順], 4走前[格,着順]
     const lines=[
       "# "+SCHEMA.csvCols.map(c=>c.label).join(","),
-      "1,ライヒスアドラー,佐々木,皐月賞,3,弥生賞,2,東スポ杯,3,新馬,1",
-      "2,マテンロウゲイル,横山和,皐月賞,10,弥生賞,2,未勝利,1,無,無",
-      "3,シュバルツクーゲル,武豊,ホープフルS,2,共同通信杯,1,東スポ杯,2,新馬,1",
-      "4,アルレッキーノ,川田,弥生賞,1,共同通信杯,3,東スポ杯,5,未勝利,1",
-      "5,トロヴァトーレ,Cデムーロ,スプリングS,2,きさらぎ賞,1,1勝クラス,1,新馬,2",
+      "1,ライヒスアドラー,佐々木,皐月賞,3,中山,2000,良,2:00.1,弥生賞,2,中山,2000,良,2:01.0,東スポ杯,3,新馬,1",
+      "2,マテンロウゲイル,横山和,皐月賞,10,中山,2000,稍重,2:02.5,弥生賞,2,中山,2000,良,2:01.3,未勝利,1,無,無",
+      "3,シュバルツクーゲル,武豊,ホープフルS,2,中山,2000,良,2:00.5,共同通信杯,1,東京,1800,良,1:46.2,東スポ杯,2,新馬,1",
+      "4,アルレッキーノ,川田,弥生賞,1,中山,2000,良,1:59.8,共同通信杯,3,東京,1800,良,1:47.0,東スポ杯,5,未勝利,1",
+      "5,トロヴァトーレ,Cデムーロ,スプリングS,2,中山,1800,重,1:50.0,きさらぎ賞,1,東京,1800,良,1:46.8,1勝クラス,1,新馬,2",
     ];
     document.getElementById("raw-input").value=lines.join("\n");
     document.getElementById("input-race-name").value="日本ダービー";
@@ -439,8 +476,35 @@ const ModProcess = (() => {
     });
   }
 
-  // 指標1つ分のスコア（0..1 or null）
-  function _metricScore(metric,rawVal){
+  // 秒変換 "1:34.5"→94.5 / "94.5"→94.5
+  function _toSec(v){
+    if(v==null) return null;
+    const s=String(v).trim();
+    const m=s.match(/(\d+):(\d+(?:\.\d+)?)/);
+    if(m) return (+m[1])*60+(+m[2]);
+    const n=parseFloat(s); return isNaN(n)?null:n;
+  }
+
+  // 指標1つ分のスコア（0..1 or null）。複数サブ列はvalがオブジェクト
+  function _metricScore(metric,val){
+    if(metric.type==="timeindex"){
+      if(val==null||typeof val!=="object") return null;
+      const {course,distance,cond,time}=val;
+      if([course,distance,cond,time].some(x=>x==null||metric.none.includes(String(x).trim())))
+        return null;
+      const key=`${course}-${distance}-${cond==="良"?"良":"良"}`; // 基準は良で持つ
+      let baseSec=metric.base[`${course}-${distance}-良`];
+      if(baseSec==null) return null;                       // 基準未登録
+      baseSec += (metric.trackOffset[cond] ?? 0);          // 馬場補正
+      const sec=_toSec(time);
+      if(sec==null) return null;
+      // 基準より速い(秒差プラス)ほど高得点
+      const diff=baseSec-sec;
+      let sc=metric.center + diff*metric.perSec;
+      return Math.max(0,Math.min(1.2,Math.round(sc*1000)/1000));
+    }
+    // 単一値系
+    const rawVal = val;
     if(rawVal==null||metric.none.includes(String(rawVal).trim())) return null;
     const v=String(rawVal).trim();
     if(metric.type==="map"){
@@ -457,12 +521,24 @@ const ModProcess = (() => {
     return null;
   }
 
+  // 出力セル用の表示文字列
+  function _display(metric,val){
+    if(metric.type==="timeindex"){
+      if(val==null||typeof val!=="object") return null;
+      const {course,distance,cond,time}=val;
+      if([course,distance,cond,time].some(x=>x==null||metric.none.includes(String(x).trim())))
+        return null;
+      return `${course}${distance}${cond} ${time}`;
+    }
+    return (val==null||metric.none.includes(String(val).trim())) ? null : String(val);
+  }
+
   // 1走分：指標を重み付け合成 → その走のスコア
   function _runScore(run){
     let sum=0, wsum=0; const detail={};
     METRICS.forEach(m=>{
       const s=_metricScore(m,run[m.key]);
-      detail[m.key]={ raw:run[m.key], score:s };
+      detail[m.key]={ raw:run[m.key], disp:_display(m,run[m.key]), score:s };
       if(s!=null){ sum+=s*m.weight; wsum+=m.weight; }
     });
     const score = wsum>0 ? sum/wsum : null;
@@ -548,10 +624,9 @@ const ModOutput = (() => {
     if(c.runCol){
       const rs=h.run_scores&&h.run_scores[c.run];
       const d=rs&&rs.detail[c.metric.key];
-      if(!d||d.raw==null||c.metric.none.includes(String(d.raw).trim()))
-        return `<span class="muted">-</span>`;
+      if(!d||d.disp==null) return `<span class="muted">-</span>`;
       const sc=d.score!=null?d.score.toFixed(3):"-";
-      return `<span class="run-cell">${esc(d.raw)}<br><small>${sc}</small></span>`;
+      return `<span class="run-cell">${esc(d.disp)}<br><small>${sc}</small></span>`;
     }
     switch(c.key){
       case "rank":  return `<b>${h.rank??"-"}</b>`;
@@ -690,7 +765,8 @@ function initSettings(){
     <div style="margin-bottom:14px">
       <div style="font-size:13px;font-weight:600;color:var(--accent)">${esc(m.label)} <span class="muted">(${m.key} / ${m.type} / 重み${m.weight})</span></div>
       <pre style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:10px;font-family:var(--font-mono);font-size:11px;overflow:auto;max-height:200px;color:var(--muted);white-space:pre;margin-top:6px">${esc(
-        m.type==="map" ? JSON.stringify(m.scoreMap,null,2)
+        m.type==="map"       ? JSON.stringify(m.scoreMap,null,2)
+        : m.type==="timeindex" ? "基準タイム(良):\n"+JSON.stringify(m.base,null,2)+"\n\n馬場補正:\n"+JSON.stringify(m.trackOffset,null,2)+`\n\n基準点:${m.center} 1秒=${m.perSec}`
         : `min:${m.min} max:${m.max} invert:${!!m.invert}`
       )}</pre>
     </div>`).join("");
