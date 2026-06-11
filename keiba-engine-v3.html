@@ -1,0 +1,994 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>競馬予想エンジン v3</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #fff; font-family: 'Helvetica Neue', Arial, sans-serif; }
+  input, textarea, button, select { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+
+// ============================================================
+// CONSTANTS & DEFAULTS
+// ============================================================
+
+const DEFAULT_MODULES = [
+  {
+    id: "mod_pr",
+    name: "PRスコア",
+    version: "1.0",
+    enabled: true,
+    description: "CSVのPR値をそのままスコアとして使用する",
+    outputVar: "pr_score",
+    formula: "PR",
+  },
+  {
+    id: "mod_opponent",
+    name: "相手指数",
+    version: "1.0",
+    enabled: true,
+    description: "過去走の着順・クラス係数から相手関係を数値化する",
+    outputVar: "opponent_score",
+    formula: "avg(run1_class_coef * run1_finish_coef, run2_class_coef * run2_finish_coef, run3_class_coef * run3_finish_coef, run4_class_coef * run4_finish_coef) * 100",
+  },
+  {
+    id: "mod_jockey",
+    name: "騎手補正",
+    version: "1.0",
+    enabled: true,
+    description: "騎手の勝率・連対率を補正値として加える",
+    outputVar: "jockey_score",
+    formula: "jockey_win_rate * 2 + jockey_place_rate",
+  },
+  {
+    id: "mod_achievement",
+    name: "馬実績補正",
+    version: "1.0",
+    enabled: true,
+    description: "馬の過去実績（賞金・勝利数）から実績補正を算出",
+    outputVar: "achievement_score",
+    formula: "total_prize / 100 + wins * 5",
+  },
+  {
+    id: "mod_total",
+    name: "統合スコア",
+    version: "1.0",
+    enabled: true,
+    description: "各モジュールスコアを統合して最終スコアを算出する",
+    outputVar: "total_score",
+    formula: "pr_score",
+  },
+  // OFF modules
+  {
+    id: "mod_time",
+    name: "タイム指数",
+    version: "1.0",
+    enabled: false,
+    description: "走破タイムから算出するタイム指数",
+    outputVar: "time_score",
+    formula: "avg(run1_time_index, run2_time_index, run3_time_index) * 1.1",
+  },
+  {
+    id: "mod_agari",
+    name: "上がり指数",
+    version: "1.0",
+    enabled: false,
+    description: "上がりタイムの平均から算出する指数",
+    outputVar: "agari_score",
+    formula: "avg(run1_agari, run2_agari, run3_agari)",
+  },
+  {
+    id: "mod_waku",
+    name: "枠順指数",
+    version: "1.0",
+    enabled: false,
+    description: "枠番と馬場条件から枠順有利不利を算出",
+    outputVar: "waku_score",
+    formula: "waku_coef * 10",
+  },
+  {
+    id: "mod_distance",
+    name: "距離適性指数",
+    version: "1.0",
+    enabled: false,
+    description: "レース距離と過去走距離の適性を算出",
+    outputVar: "distance_score",
+    formula: "distance_apt * 10",
+  },
+  {
+    id: "mod_baba",
+    name: "馬場適性指数",
+    version: "1.0",
+    enabled: false,
+    description: "馬場状態（良・稍重・重・不良）との適性を算出",
+    outputVar: "baba_score",
+    formula: "baba_apt * 10",
+  },
+  {
+    id: "mod_growth",
+    name: "成長指数",
+    version: "1.0",
+    enabled: false,
+    description: "馬齢と成長曲線から成長段階を補正",
+    outputVar: "growth_score",
+    formula: "growth_coef * 10",
+  },
+  {
+    id: "mod_blood",
+    name: "血統指数",
+    version: "1.0",
+    enabled: false,
+    description: "父・母父の血統評価から指数を算出",
+    outputVar: "blood_score",
+    formula: "sire_score + damsire_score",
+  },
+  {
+    id: "mod_tenkai",
+    name: "展開指数",
+    version: "1.0",
+    enabled: false,
+    description: "脚質と展開予測から展開有利不利を算出",
+    outputVar: "tenkai_score",
+    formula: "pace_coef * style_coef * 10",
+  },
+  {
+    id: "mod_expect",
+    name: "期待値指数",
+    version: "1.0",
+    enabled: false,
+    description: "オッズと能力評価から期待値を算出",
+    outputVar: "expect_score",
+    formula: "ability_score / odds * 10",
+  },
+  {
+    id: "mod_popular",
+    name: "人気乖離指数",
+    version: "1.0",
+    enabled: false,
+    description: "人気と実力の乖離を数値化する",
+    outputVar: "popular_score",
+    formula: "ability_score - popular_rank * 2",
+  },
+];
+
+const INITIAL_PROFILE = {
+  name: "デフォルトプロファイル",
+  version: "1.0",
+  savedAt: null,
+};
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+function generateId() {
+  return "mod_" + Math.random().toString(36).slice(2, 9);
+}
+
+function formatDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split("\n").filter(l => l.trim());
+  if (lines.length < 2) return null;
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+  const rows = lines.slice(1).map(line => {
+    const vals = line.split(",").map(v => v.trim().replace(/^"|"$/g, ""));
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = vals[i] ?? ""; });
+    return obj;
+  });
+  return { headers, rows };
+}
+
+function toNum(v) {
+  if (v === undefined || v === null || v === "" || v === "無" || v === "-") return 0;
+  const n = Number(v);
+  return isNaN(n) ? 0 : n;
+}
+
+function evaluateFormula(formula, vars) {
+  try {
+    let expr = formula;
+    // Map all variable names to safe JS identifiers via a lookup object
+    const safeVars = {};
+    const keyMap = {};
+    Object.keys(vars).forEach((k, i) => {
+      const safe = "_v" + i;
+      keyMap[k] = safe;
+      safeVars[safe] = toNum(vars[k]);
+    });
+    // Replace variable names in expression (longest first to avoid partial matches)
+    const sortedKeys = Object.keys(keyMap).sort((a, b) => b.length - a.length);
+    sortedKeys.forEach(k => {
+      // Replace whole-word occurrences only
+      expr = expr.split(k).join(keyMap[k]);
+    });
+    // Replace avg(a,b,c) with arithmetic mean
+    expr = expr.replace(/avg\(([^)]+)\)/g, (_, args) => {
+      const parts = args.split(",").map(a => a.trim());
+      return `((${parts.join("+")})*1/${parts.length})`;
+    });
+    expr = expr.replace(/max\(([^)]+)\)/g, (_, args) => {
+      const parts = args.split(",").map(a => a.trim());
+      return `Math.max(${parts.join(",")})`;
+    });
+    expr = expr.replace(/min\(([^)]+)\)/g, (_, args) => {
+      const parts = args.split(",").map(a => a.trim());
+      return `Math.min(${parts.join(",")})`;
+    });
+    const fn = new Function(...Object.keys(safeVars), `return (${expr});`);
+    const result = fn(...Object.values(safeVars));
+    return isNaN(result) || !isFinite(result) ? 0 : result;
+  } catch {
+    return 0;
+  }
+}
+
+function runAnalysis(csvData, modules) {
+  const enabledModules = modules.filter(m => m.enabled);
+  const results = csvData.rows.map(row => {
+    const vars = { ...row };
+    const moduleScores = {};
+    for (const mod of enabledModules) {
+      const score = evaluateFormula(mod.formula, { ...vars, ...moduleScores });
+      moduleScores[mod.outputVar] = score;
+    }
+    const total = moduleScores["total_score"] ?? 0;
+    return { row, moduleScores, total };
+  });
+  results.sort((a, b) => b.total - a.total);
+  return results.map((r, i) => ({ ...r, rank: i + 1 }));
+}
+
+function validateFormula(formula, modules, currentId) {
+  const errors = [];
+  // Check parens
+  let depth = 0;
+  for (const ch of formula) {
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    if (depth < 0) { errors.push("括弧の対応が不一致"); break; }
+  }
+  if (depth !== 0) errors.push("括弧の対応が不一致");
+  // Check circular (simple: outputVar used in own formula)
+  const mod = modules.find(m => m.id === currentId);
+  if (mod && formula.includes(mod.outputVar)) errors.push("循環参照の可能性");
+  // Check OFF module reference
+  for (const m of modules) {
+    if (!m.enabled && m.id !== currentId && formula.includes(m.outputVar)) {
+      errors.push(`OFFモジュール "${m.name}" を参照している`);
+    }
+  }
+  return errors;
+}
+
+// ============================================================
+// STORAGE
+// ============================================================
+const STORAGE_KEYS = {
+  modules: "keibaV3_modules",
+  profile: "keibaV3_profile",
+  history: "keibaV3_history",
+};
+
+// NOTE: localStorage is not available in this environment.
+// Data lives in memory during the session. Use エクスポート/インポート to persist.
+const memStore = {};
+function loadStorage(key, fallback) {
+  return memStore[key] !== undefined ? memStore[key] : fallback;
+}
+function saveStorage(key, val) {
+  memStore[key] = val;
+}
+
+// ============================================================
+// STYLES (inline, mono-chrome)
+// ============================================================
+const S = {
+  app: { fontFamily: "'Helvetica Neue', Arial, sans-serif", background: "#fff", minHeight: "100vh", maxWidth: 480, margin: "0 auto", color: "#111", fontSize: 14 },
+  header: { borderBottom: "1px solid #ccc", padding: "12px 16px", fontWeight: 700, fontSize: 16, letterSpacing: 1 },
+  tabs: { display: "flex", borderBottom: "1px solid #ccc", background: "#fff", position: "sticky", top: 0, zIndex: 10 },
+  tab: (active) => ({ flex: 1, padding: "10px 4px", textAlign: "center", fontSize: 12, fontWeight: active ? 700 : 400, borderBottom: active ? "2px solid #111" : "2px solid transparent", cursor: "pointer", background: "none", border: "none", borderBottomWidth: 2, borderBottomStyle: "solid", borderBottomColor: active ? "#111" : "transparent", color: "#111" }),
+  page: { padding: "12px 16px" },
+  btn: { padding: "8px 14px", border: "1px solid #111", background: "#fff", color: "#111", fontSize: 13, cursor: "pointer", fontWeight: 500 },
+  btnPrimary: { padding: "8px 14px", border: "none", background: "#111", color: "#fff", fontSize: 13, cursor: "pointer", fontWeight: 500 },
+  btnSmall: { padding: "4px 10px", border: "1px solid #111", background: "#fff", color: "#111", fontSize: 12, cursor: "pointer" },
+  btnSmallFill: { padding: "4px 10px", border: "none", background: "#111", color: "#fff", fontSize: 12, cursor: "pointer" },
+  label: { fontSize: 11, color: "#666", marginBottom: 3, display: "block" },
+  input: { width: "100%", border: "1px solid #ccc", padding: "7px 10px", fontSize: 13, boxSizing: "border-box", outline: "none", background: "#fff", color: "#111" },
+  textarea: { width: "100%", border: "1px solid #ccc", padding: "7px 10px", fontSize: 12, fontFamily: "monospace", boxSizing: "border-box", minHeight: 120, resize: "vertical", outline: "none" },
+  row: { display: "flex", gap: 8, alignItems: "center" },
+  section: { marginBottom: 16 },
+  card: { border: "1px solid #ddd", padding: "10px 12px", marginBottom: 8 },
+  divider: { borderTop: "1px solid #eee", margin: "10px 0" },
+  error: { color: "#111", background: "#f0f0f0", border: "1px solid #ccc", padding: "6px 10px", fontSize: 12, marginBottom: 6 },
+  tag: { display: "inline-block", border: "1px solid #999", fontSize: 11, padding: "1px 6px", marginRight: 4 },
+  tagOff: { display: "inline-block", border: "1px solid #ccc", fontSize: 11, padding: "1px 6px", marginRight: 4, color: "#999" },
+};
+
+// ============================================================
+// COMPONENTS
+// ============================================================
+
+function Modal({ title, onClose, children }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 100, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "20px 0" }}>
+      <div style={{ background: "#fff", width: "95%", maxWidth: 460, border: "1px solid #111" }}>
+        <div style={{ ...S.row, padding: "10px 14px", borderBottom: "1px solid #ccc", justifyContent: "space-between" }}>
+          <span style={{ fontWeight: 700 }}>{title}</span>
+          <button onClick={onClose} style={{ ...S.btn, padding: "2px 8px" }}>✕</button>
+        </div>
+        <div style={{ padding: "14px" }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function FormulaBuilder({ formula, onChange, modules, currentId }) {
+  const csvVars = ["PR", "horse_number", "horse_name", "jockey", "weight", "odds", "popular_rank", "total_prize", "wins", "waku_coef", "distance_apt", "baba_apt", "growth_coef", "sire_score", "damsire_score", "pace_coef", "style_coef", "ability_score", "jockey_win_rate", "jockey_place_rate", "run1_class_coef", "run1_finish_coef", "run1_time_index", "run1_agari", "run2_class_coef", "run2_finish_coef", "run2_time_index", "run2_agari", "run3_class_coef", "run3_finish_coef", "run3_time_index", "run3_agari", "run4_class_coef", "run4_finish_coef"];
+  const ops = ["+", "-", "*", "/", "(", ")", "avg(", "max(", "min(", ",", ")"];
+  const append = (val) => onChange(formula + val);
+  const enabledMods = modules.filter(m => m.enabled && m.id !== currentId);
+  const errors = validateFormula(formula, modules, currentId);
+
+  return (
+    <div>
+      <label style={S.label}>計算式</label>
+      <textarea style={{ ...S.textarea, minHeight: 70 }} value={formula} onChange={e => onChange(e.target.value)} />
+      {errors.length > 0 && errors.map((e, i) => <div key={i} style={S.error}>⚠ {e}</div>)}
+      <div style={S.divider} />
+      <div style={{ marginBottom: 6, fontSize: 11, color: "#666" }}>演算子</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+        {ops.map(op => <button key={op} style={{ ...S.btnSmall, fontFamily: "monospace" }} onClick={() => append(op)}>{op}</button>)}
+      </div>
+      <div style={{ marginBottom: 6, fontSize: 11, color: "#666" }}>CSVカラム / PR変数</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+        {csvVars.map(v => <button key={v} style={{ ...S.btnSmall, fontSize: 11 }} onClick={() => append(v)}>{v}</button>)}
+      </div>
+      {enabledMods.length > 0 && <>
+        <div style={{ marginBottom: 6, fontSize: 11, color: "#666" }}>他モジュール出力変数</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+          {enabledMods.map(m => <button key={m.id} style={{ ...S.btnSmall, fontSize: 11 }} onClick={() => append(m.outputVar)}>{m.outputVar}</button>)}
+        </div>
+      </>}
+      <button style={{ ...S.btnSmall, marginTop: 4 }} onClick={() => onChange("")}>クリア</button>
+    </div>
+  );
+}
+
+// ============================================================
+// TAB 1: 予想
+// ============================================================
+function PredictionTab({ modules, history, setHistory }) {
+  const [csvText, setCsvText] = useState("");
+  const [csvData, setCsvData] = useState(null);
+  const [results, setResults] = useState(null);
+  const [raceInfo, setRaceInfo] = useState(null);
+  const [expanded, setExpanded] = useState({});
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [overwriteConfirm, setOverwriteConfirm] = useState(false);
+  const fileRef = useRef();
+
+  const loadCSV = () => {
+    const parsed = parseCSV(csvText);
+    if (!parsed) { setError("CSVの形式が正しくありません"); return; }
+    setError("");
+    setCsvData(parsed);
+    const first = parsed.rows[0] || {};
+    setRaceInfo({
+      raceId: first.race_id || first.RaceID || first["レースID"] || (first["開催日"] + "_" + first["レース番号"]) || String(Date.now()),
+      date: first.race_date || first.開催日 || "—",
+      name: first.race_name || first.レース名 || "—",
+      place: first.place || first.開催場 || "—",
+      count: parsed.rows.length,
+    });
+    setResults(null);
+    setSaved(false);
+  };
+
+  const runPrediction = () => {
+    if (!csvData) { setError("先にCSVを読み込んでください"); return; }
+    const res = runAnalysis(csvData, modules);
+    setResults(res);
+    setSaved(false);
+  };
+
+  const saveCSV = () => {
+    if (!csvText) return;
+    const blob = new Blob([csvText], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `race_${raceInfo?.raceId || "data"}.csv`;
+    a.click();
+  };
+
+  const savePrediction = () => {
+    if (!results || !raceInfo) { setError("予想結果がありません"); return; }
+    const raceId = raceInfo.raceId;
+    const entry = {
+      raceId,
+      raceDate: raceInfo.date,
+      raceName: raceInfo.name,
+      racePlace: raceInfo.place,
+      csvText,
+      predictions: results.map(r => ({
+        rank: r.rank,
+        horseName: r.row["馬名"] || r.row.horse_name || "—",
+        horseNumber: r.row["馬番"] || r.row.horse_number || "—",
+        total: r.total,
+        moduleScores: r.moduleScores,
+      })),
+      modules: modules.filter(m => m.enabled).map(m => ({ name: m.name, outputVar: m.outputVar, formula: m.formula })),
+      resultEntered: false,
+      result: null,
+      savedAt: new Date().toISOString(),
+    };
+    const existing = history.find(h => h.raceId === raceId);
+    if (existing && !overwriteConfirm) {
+      setOverwriteConfirm(true);
+      return;
+    }
+    const updated = existing
+      ? history.map(h => h.raceId === raceId ? entry : h)
+      : [entry, ...history];
+    setHistory(updated);
+    saveStorage(STORAGE_KEYS.history, updated);
+    setSaved(true);
+    setOverwriteConfirm(false);
+  };
+
+  const toggleRow = (i) => setExpanded(p => ({ ...p, [i]: !p[i] }));
+
+  return (
+    <div style={S.page}>
+      <div style={S.section}>
+        <label style={S.label}>CSVテキスト貼り付け</label>
+        <textarea style={S.textarea} value={csvText} onChange={e => setCsvText(e.target.value)} placeholder={"race_id,race_date,race_name,...\n1001,2024/06/09,東京10R,東京,..."} />
+        <div style={{ marginTop: 6, fontSize: 11, color: "#888" }}>またはファイル選択: <input ref={fileRef} type="file" accept=".csv" style={{ fontSize: 12 }} onChange={e => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = ev => setCsvText(ev.target.result);
+          reader.readAsText(file, "utf-8");
+        }} /></div>
+      </div>
+      {error && <div style={S.error}>{error}</div>}
+      <div style={{ ...S.row, gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+        <button style={S.btnPrimary} onClick={loadCSV}>CSV読込</button>
+        <button style={S.btn} onClick={runPrediction}>予想実行</button>
+        <button style={results ? S.btnPrimary : S.btn} onClick={savePrediction}>
+          {saved ? "保存済み ✓" : overwriteConfirm ? "もう一度押して上書き" : "予想保存"}
+        </button>
+        <button style={S.btn} onClick={saveCSV}>CSV保存</button>
+      </div>
+
+      {raceInfo && (
+        <div style={{ ...S.card, marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>レース情報</div>
+          {[["RaceID", raceInfo.raceId], ["開催日", raceInfo.date], ["レース名", raceInfo.name], ["開催場", raceInfo.place], ["頭数", raceInfo.count + "頭"]].map(([k, v]) => (
+            <div key={k} style={{ ...S.row, justifyContent: "space-between", borderTop: "1px solid #eee", padding: "4px 0" }}>
+              <span style={{ color: "#666", fontSize: 12 }}>{k}</span>
+              <span style={{ fontWeight: 500 }}>{v}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {results && (
+        <div>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>予想結果</div>
+          <div style={{ ...S.row, fontWeight: 700, fontSize: 12, padding: "4px 0", borderBottom: "1px solid #ccc" }}>
+            <span style={{ width: 32 }}>順位</span>
+            <span style={{ width: 36 }}>馬番</span>
+            <span style={{ flex: 1 }}>馬名</span>
+            <span style={{ width: 70, textAlign: "right" }}>総合スコア</span>
+          </div>
+          {results.map((r, i) => (
+            <div key={i}>
+              <div style={{ ...S.row, padding: "8px 0", borderBottom: "1px solid #eee", cursor: "pointer" }} onClick={() => toggleRow(i)}>
+                <span style={{ width: 32, fontWeight: 700, fontSize: 15 }}>{r.rank}</span>
+                <span style={{ width: 36 }}>{r.row.horse_number || r.row.馬番 || "—"}</span>
+                <span style={{ flex: 1 }}>{r.row.horse_name || r.row.馬名 || "—"}</span>
+                <span style={{ width: 70, textAlign: "right", fontFamily: "monospace" }}>{r.total.toFixed(2)}</span>
+                <span style={{ fontSize: 11, color: "#999", marginLeft: 4 }}>{expanded[i] ? "▲" : "▼"}</span>
+              </div>
+              {expanded[i] && (
+                <div style={{ background: "#f9f9f9", border: "1px solid #eee", padding: "8px 12px", marginBottom: 4, fontSize: 12 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 6 }}>モジュール別スコア</div>
+                  {Object.entries(r.moduleScores).map(([k, v]) => (
+                    <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "2px 0" }}>
+                      <span style={{ color: "#555" }}>{k}</span>
+                      <span style={{ fontFamily: "monospace" }}>{Number(v).toFixed(4)}</span>
+                    </div>
+                  ))}
+                  <div style={S.divider} />
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>使用モジュール</div>
+                  {modules.filter(m => m.enabled).map(m => (
+                    <div key={m.id} style={{ fontSize: 11, marginBottom: 2 }}>
+                      <span style={S.tag}>{m.name}</span> {m.outputVar}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// TAB 2: 分析設定
+// ============================================================
+function SettingsTab({ modules, setModules }) {
+  const [profile, setProfile] = useState(() => loadStorage(STORAGE_KEYS.profile, INITIAL_PROFILE));
+  const [editMod, setEditMod] = useState(null); // module being edited
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [profileMsg, setProfileMsg] = useState("");
+  const [initConfirm, setInitConfirm] = useState(false);
+
+  const saveProfile = () => {
+    const p = { ...profile, savedAt: new Date().toISOString(), version: profile.version };
+    setProfile(p);
+    saveStorage(STORAGE_KEYS.profile, p);
+    saveStorage(STORAGE_KEYS.modules, modules);
+    setProfileMsg("保存しました");
+    setTimeout(() => setProfileMsg(""), 2000);
+  };
+
+  const initProfile = () => {
+    if (!initConfirm) { setInitConfirm(true); setTimeout(() => setInitConfirm(false), 3000); return; }
+    setModules(DEFAULT_MODULES);
+    const p = { ...INITIAL_PROFILE, savedAt: null };
+    setProfile(p);
+    saveStorage(STORAGE_KEYS.modules, DEFAULT_MODULES);
+    saveStorage(STORAGE_KEYS.profile, p);
+    setInitConfirm(false);
+  };
+
+  const toggleModule = (id) => {
+    setModules(prev => prev.map(m => m.id === id ? { ...m, enabled: !m.enabled } : m));
+  };
+
+  const duplicateModule = (mod) => {
+    const newMod = { ...mod, id: generateId(), name: mod.name + " (複製)", outputVar: mod.outputVar + "_copy" };
+    setModules(prev => [...prev, newMod]);
+  };
+
+  const deleteModule = (id) => {
+    setModules(prev => prev.filter(m => m.id !== id));
+    setConfirmDelete(null);
+  };
+
+  const addModule = () => {
+    const newMod = { id: generateId(), name: "新しいモジュール", version: "1.0", enabled: false, description: "", outputVar: "new_score", formula: "0" };
+    setEditMod(newMod);
+  };
+
+  const saveModule = (mod) => {
+    const errors = validateFormula(mod.formula, modules, mod.id);
+    if (errors.length > 0) { return; } // errors are displayed in the formula builder
+    setModules(prev => {
+      const exists = prev.find(m => m.id === mod.id);
+      return exists ? prev.map(m => m.id === mod.id ? mod : m) : [...prev, mod];
+    });
+    setEditMod(null);
+  };
+
+  return (
+    <div style={S.page}>
+      {/* Profile */}
+      <div style={{ ...S.card, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>分析プロファイル</div>
+        <div style={{ marginBottom: 6 }}>
+          <label style={S.label}>プロファイル名</label>
+          <input style={S.input} value={profile.name} onChange={e => setProfile(p => ({ ...p, name: e.target.value }))} />
+        </div>
+        <div style={{ marginBottom: 6 }}>
+          <label style={S.label}>分析Version</label>
+          <input style={S.input} value={profile.version} onChange={e => setProfile(p => ({ ...p, version: e.target.value }))} />
+        </div>
+        <div style={{ fontSize: 12, color: "#666", marginBottom: 8 }}>保存日時: {formatDate(profile.savedAt)}</div>
+        <div style={{ ...S.row, gap: 8 }}>
+          <button style={S.btnPrimary} onClick={saveProfile}>設定保存</button>
+          <button style={S.btn} onClick={initProfile}>{initConfirm ? "もう一度押して初期化" : "初期化"}</button>
+          {profileMsg && <span style={{ fontSize: 12, fontWeight: 700 }}>{profileMsg}</span>}
+        </div>
+      </div>
+
+      {/* Module list */}
+      <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontWeight: 700 }}>モジュール一覧</span>
+        <button style={S.btnSmallFill} onClick={addModule}>＋ 追加</button>
+      </div>
+      {modules.map(mod => (
+        <div key={mod.id} style={{ ...S.card, padding: "8px 12px" }}>
+          <div style={{ ...S.row, justifyContent: "space-between" }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>{mod.name} <span style={{ fontSize: 11, color: "#888" }}>v{mod.version}</span></div>
+              <div style={{ fontSize: 11, color: "#666", marginTop: 2 }}>{mod.outputVar}</div>
+              {mod.description && <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{mod.description}</div>}
+            </div>
+            <div style={{ ...S.row, gap: 6, alignItems: "center" }}>
+              <button style={{ ...S.btnSmall, fontSize: 11, padding: "3px 8px", background: mod.enabled ? "#111" : "#fff", color: mod.enabled ? "#fff" : "#111" }} onClick={() => toggleModule(mod.id)}>
+                {mod.enabled ? "ON" : "OFF"}
+              </button>
+            </div>
+          </div>
+          <div style={{ ...S.row, gap: 6, marginTop: 8 }}>
+            <button style={S.btnSmall} onClick={() => setEditMod({ ...mod })}>編集</button>
+            <button style={S.btnSmall} onClick={() => duplicateModule(mod)}>複製</button>
+            <button style={S.btnSmall} onClick={() => setConfirmDelete(mod.id)}>削除</button>
+          </div>
+        </div>
+      ))}
+
+      {/* Edit Modal */}
+      {editMod && (
+        <Modal title={editMod.id.startsWith("mod_") && modules.find(m => m.id === editMod.id) ? "モジュール編集" : "モジュール追加"} onClose={() => setEditMod(null)}>
+          <ModuleEditor mod={editMod} onChange={setEditMod} modules={modules} onSave={saveModule} onCancel={() => setEditMod(null)} />
+        </Modal>
+      )}
+
+      {/* Delete Confirm */}
+      {confirmDelete && (
+        <Modal title="削除確認" onClose={() => setConfirmDelete(null)}>
+          <p style={{ fontSize: 13 }}>このモジュールを削除しますか？</p>
+          <div style={{ ...S.row, gap: 8 }}>
+            <button style={S.btnPrimary} onClick={() => deleteModule(confirmDelete)}>削除</button>
+            <button style={S.btn} onClick={() => setConfirmDelete(null)}>キャンセル</button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function ModuleEditor({ mod, onChange, modules, onSave, onCancel }) {
+  const errors = validateFormula(mod.formula, modules, mod.id);
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <label style={S.label}>名称</label>
+        <input style={S.input} value={mod.name} onChange={e => onChange(m => ({ ...m, name: e.target.value }))} />
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label style={S.label}>Version</label>
+        <input style={S.input} value={mod.version} onChange={e => onChange(m => ({ ...m, version: e.target.value }))} />
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label style={S.label}>出力変数名</label>
+        <input style={S.input} value={mod.outputVar} onChange={e => onChange(m => ({ ...m, outputVar: e.target.value }))} />
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label style={S.label}>説明</label>
+        <input style={S.input} value={mod.description} onChange={e => onChange(m => ({ ...m, description: e.target.value }))} />
+      </div>
+      <div style={S.divider} />
+      <FormulaBuilder formula={mod.formula} onChange={f => onChange(m => ({ ...m, formula: f }))} modules={modules} currentId={mod.id} />
+      <div style={S.divider} />
+      <div style={{ ...S.row, gap: 8 }}>
+        <button style={{ ...S.btnPrimary, opacity: errors.length > 0 ? 0.4 : 1 }} onClick={() => onSave(mod)} disabled={errors.length > 0}>保存</button>
+        <button style={S.btn} onClick={onCancel}>キャンセル</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// TAB 3: 履歴
+// ============================================================
+function HistoryTab({ modules, history, setHistory }) {
+  const [expanded, setExpanded] = useState({});
+  const [resultInput, setResultInput] = useState(null);
+  const [reanalysis, setReanalysis] = useState({});
+
+  const toggle = (id) => setExpanded(p => ({ ...p, [id]: !p[id] }));
+
+  const saveResult = (raceId, data) => {
+    const updated = history.map(h => h.raceId === raceId ? { ...h, result: data, resultEntered: true } : h);
+    setHistory(updated);
+    saveStorage(STORAGE_KEYS.history, updated);
+    setResultInput(null);
+  };
+
+  const exportCSV = (h) => {
+    const blob = new Blob([h.csvText], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `race_${h.raceId}.csv`;
+    a.click();
+  };
+
+  const runReanalysis = (h) => {
+    const parsed = parseCSV(h.csvText);
+    if (!parsed) return;
+    const res = runAnalysis(parsed, modules);
+    setReanalysis(p => ({ ...p, [h.raceId]: res }));
+  };
+
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const deleteHistory = (raceId) => {
+    if (deleteConfirm !== raceId) {
+      setDeleteConfirm(raceId);
+      setTimeout(() => setDeleteConfirm(null), 3000);
+      return;
+    }
+    const updated = history.filter(h => h.raceId !== raceId);
+    setHistory(updated);
+    saveStorage(STORAGE_KEYS.history, updated);
+    setDeleteConfirm(null);
+  };
+
+  const exportAll = () => {
+    const blob = new Blob([JSON.stringify(history, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "keiba_history.json";
+    a.click();
+  };
+
+  const importAll = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!Array.isArray(data)) throw new Error();
+        // Merge by raceId (imported wins)
+        const merged = [...data];
+        history.forEach(h => { if (!merged.find(m => m.raceId === h.raceId)) merged.push(h); });
+        setHistory(merged);
+        saveStorage(STORAGE_KEYS.history, merged);
+      } catch {
+        // invalid file, ignore
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const importExportBar = (
+    <div style={{ ...S.row, gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+      <button style={S.btnSmall} onClick={exportAll}>履歴エクスポート (JSON)</button>
+      <label style={{ ...S.btnSmall, display: "inline-block" }}>
+        履歴インポート
+        <input type="file" accept=".json" style={{ display: "none" }} onChange={importAll} />
+      </label>
+    </div>
+  );
+
+  if (history.length === 0) return (
+    <div style={S.page}>
+      {importExportBar}
+      <div style={{ color: "#888", textAlign: "center", paddingTop: 40 }}>
+        <div style={{ fontSize: 14 }}>保存された履歴はありません</div>
+        <div style={{ fontSize: 12, marginTop: 8 }}>予想タブで「予想保存」を押すとここに表示されます</div>
+        <div style={{ fontSize: 11, marginTop: 12, color: "#aaa" }}>※ データはセッション中のみ保持されます。JSONエクスポートで保存してください</div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={S.page}>
+      {importExportBar}
+      <div style={{ fontWeight: 700, marginBottom: 10 }}>履歴一覧 ({history.length}件)</div>
+      {history.map(h => (
+        <div key={h.raceId} style={{ ...S.card, padding: 0 }}>
+          <div style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggle(h.raceId)}>
+            <div style={{ ...S.row, justifyContent: "space-between" }}>
+              <div>
+                <span style={{ fontWeight: 600 }}>{h.raceName}</span>
+                <span style={{ fontSize: 11, color: "#888", marginLeft: 8 }}>{h.raceDate}</span>
+              </div>
+              <span style={{ fontSize: 11, border: "1px solid #ccc", padding: "1px 6px" }}>{h.resultEntered ? "結果入力済" : "未入力"}</span>
+            </div>
+            <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>ID: {h.raceId} · {h.savedAt ? formatDate(h.savedAt) : "—"}</div>
+          </div>
+          {expanded[h.raceId] && (
+            <div style={{ borderTop: "1px solid #eee", padding: "10px 12px" }}>
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>予想順位</div>
+              {(h.predictions || []).slice(0, 5).map((p, i) => (
+                <div key={i} style={{ ...S.row, fontSize: 12, padding: "2px 0" }}>
+                  <span style={{ width: 24, fontWeight: 700 }}>{p.rank}</span>
+                  <span style={{ flex: 1 }}>{p.horseName}</span>
+                  <span style={{ fontFamily: "monospace", color: "#555" }}>{Number(p.total).toFixed(2)}</span>
+                </div>
+              ))}
+              {h.result && (
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  <span style={{ fontWeight: 700 }}>結果: </span>
+                  1着 {h.result.first} / 2着 {h.result.second} / 3着 {h.result.third}
+                </div>
+              )}
+
+              {/* Re-analysis */}
+              {reanalysis[h.raceId] && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 4 }}>再分析結果</div>
+                  {reanalysis[h.raceId].slice(0, 5).map((r, i) => {
+                    const orig = (h.predictions || []).find(p => p.horseName === (r.row.horse_name || r.row.馬名));
+                    const origRank = orig ? orig.rank : "—";
+                    const diff = orig ? origRank - r.rank : 0;
+                    return (
+                      <div key={i} style={{ ...S.row, fontSize: 12, padding: "2px 0" }}>
+                        <span style={{ width: 24, fontWeight: 700 }}>{r.rank}</span>
+                        <span style={{ flex: 1 }}>{r.row.horse_name || r.row.馬名}</span>
+                        <span style={{ fontFamily: "monospace", color: "#555" }}>{r.total.toFixed(2)}</span>
+                        <span style={{ fontSize: 11, marginLeft: 6 }}>({origRank}→{r.rank} {diff > 0 ? "+" : ""}{diff !== 0 ? diff : ""})</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div style={{ ...S.row, gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+                <button style={S.btnSmall} onClick={() => setResultInput(h)}>結果入力</button>
+                <button style={S.btnSmall} onClick={() => runReanalysis(h)}>再分析</button>
+                <button style={S.btnSmall} onClick={() => exportCSV(h)}>CSV出力</button>
+                <button style={S.btnSmall} onClick={() => deleteHistory(h.raceId)}>{deleteConfirm === h.raceId ? "もう一度押して削除" : "削除"}</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {resultInput && (
+        <Modal title="結果入力" onClose={() => setResultInput(null)}>
+          <ResultInputForm h={resultInput} onSave={saveResult} onCancel={() => setResultInput(null)} />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function ResultInputForm({ h, onSave, onCancel }) {
+  const [first, setFirst] = useState(h.result?.first || "");
+  const [second, setSecond] = useState(h.result?.second || "");
+  const [third, setThird] = useState(h.result?.third || "");
+  return (
+    <div>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>{h.raceName}</div>
+      {[["1着", first, setFirst], ["2着", second, setSecond], ["3着", third, setThird]].map(([label, val, setter]) => (
+        <div key={label} style={{ marginBottom: 8 }}>
+          <label style={S.label}>{label}</label>
+          <input style={S.input} value={val} onChange={e => setter(e.target.value)} placeholder="馬名" />
+        </div>
+      ))}
+      <div style={{ ...S.row, gap: 8, marginTop: 12 }}>
+        <button style={S.btnPrimary} onClick={() => onSave(h.raceId, { first, second, third })}>保存</button>
+        <button style={S.btn} onClick={onCancel}>キャンセル</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// TAB 4: 累積分析
+// ============================================================
+function AccumulationTab({ history }) {
+  const entered = history.filter(h => h.resultEntered && h.result);
+  const total = history.length;
+  const enteredCount = entered.length;
+
+  let pred1Win = 0, pred3Win = 0, pred5Win = 0;
+  let top3Capture = 0, top5Capture = 0;
+  let rankErrors = [];
+
+  entered.forEach(h => {
+    const preds = h.predictions || [];
+    const result = h.result;
+    const winners = [result.first, result.second, result.third].filter(Boolean);
+    const top1 = preds.find(p => p.rank === 1);
+    if (top1 && winners.includes(top1.horseName)) pred1Win++;
+    const top3Names = preds.filter(p => p.rank <= 3).map(p => p.horseName);
+    if (winners.some(w => top3Names.includes(w))) pred3Win++;
+    const top5Names = preds.filter(p => p.rank <= 5).map(p => p.horseName);
+    if (winners.some(w => top5Names.includes(w))) pred5Win++;
+    // capture
+    winners.forEach(w => {
+      const found = preds.find(p => p.horseName === w);
+      if (found) { if (found.rank <= 3) top3Capture++; if (found.rank <= 5) top5Capture++; }
+    });
+    // avg rank error
+    winners.forEach(w => {
+      const found = preds.find(p => p.horseName === w);
+      if (found) rankErrors.push(found.rank);
+    });
+  });
+
+  const pct = (n, d) => d === 0 ? "—" : (n / d * 100).toFixed(1) + "%";
+  const avgErr = rankErrors.length > 0 ? (rankErrors.reduce((a, b) => a + b, 0) / rankErrors.length).toFixed(1) : "—";
+
+  const stats = [
+    ["保存レース数", total + "件"],
+    ["結果入力済み", enteredCount + "件"],
+    ["予想1位勝率", pct(pred1Win, enteredCount)],
+    ["予想TOP3勝率", pct(pred3Win, enteredCount)],
+    ["予想TOP5勝率", pct(pred5Win, enteredCount)],
+    ["TOP3内勝ち馬捕捉率", pct(top3Capture, entered.length * 3)],
+    ["TOP5内勝ち馬捕捉率", pct(top5Capture, entered.length * 3)],
+    ["勝ち馬平均予想順位", avgErr === "—" ? "—" : avgErr + "位"],
+  ];
+
+  return (
+    <div style={S.page}>
+      <div style={{ fontWeight: 700, marginBottom: 12 }}>累積分析</div>
+      {enteredCount === 0 && (
+        <div style={{ color: "#888", fontSize: 13, marginBottom: 16 }}>結果入力済みレースがありません。履歴タブで結果を入力してください。</div>
+      )}
+      <div style={S.card}>
+        {stats.map(([k, v]) => (
+          <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #eee" }}>
+            <span style={{ fontSize: 13, color: "#444" }}>{k}</span>
+            <span style={{ fontWeight: 700, fontSize: 15, fontFamily: "monospace" }}>{v}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginTop: 16, fontSize: 12, color: "#888" }}>
+        ※ 回収率・3連複/3連単的中率は将来追加予定
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+function App() {
+  const [tab, setTab] = useState(0);
+  const [history, setHistory] = useState(() => loadStorage(STORAGE_KEYS.history, []));
+  const [modules, setModules] = useState(() => {
+    const saved = loadStorage(STORAGE_KEYS.modules, null);
+    if (!saved) return DEFAULT_MODULES;
+    // Merge: add any DEFAULT module not present in saved (by id)
+    const savedIds = new Set(saved.map(m => m.id));
+    const missing = DEFAULT_MODULES.filter(m => !savedIds.has(m.id));
+    return missing.length > 0 ? [...missing, ...saved] : saved;
+  });
+
+  // Persist modules
+  useEffect(() => { saveStorage(STORAGE_KEYS.modules, modules); }, [modules]);
+
+  const tabLabels = ["予想", "分析設定", "履歴", "累積分析"];
+
+  return (
+    <div style={S.app}>
+      <div style={S.header}>🏇 競馬予想エンジン v3</div>
+      <div style={S.tabs}>
+        {tabLabels.map((l, i) => (
+          <button key={i} style={S.tab(tab === i)} onClick={() => setTab(i)}>{l}</button>
+        ))}
+      </div>
+      {tab === 0 && <PredictionTab modules={modules} history={history} setHistory={setHistory} />}
+      {tab === 1 && <SettingsTab modules={modules} setModules={setModules} />}
+      {tab === 2 && <HistoryTab modules={modules} history={history} setHistory={setHistory} />}
+      {tab === 3 && <AccumulationTab history={history} />}
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
