@@ -287,8 +287,11 @@ const STORAGE_KEYS = {
 };
 
 // ============================================================
-// GITHUB STORAGE
+// SUPABASE STORAGE
 // ============================================================
+const SUPABASE_URL = "https://kxedmjixqswrdboqyupg.supabase.co";
+const SUPABASE_KEY = "sb_publishable_alXlqXjHEURfgg-cmP00VQ_1lt8FLAC";
+
 const memStore = {};
 function loadStorage(key, fallback) {
   return memStore[key] !== undefined ? memStore[key] : fallback;
@@ -297,39 +300,35 @@ function saveStorage(key, val) {
   memStore[key] = val;
 }
 
-// GitHub API helpers
-async function githubRequest(cfg, path, method, body) {
-  const url = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${path}`;
-  const headers = {
-    "Authorization": `token ${cfg.token}`,
-    "Accept": "application/vnd.github.v3+json",
-    "Content-Type": "application/json",
-  };
-  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
-  return { ok: res.ok, status: res.status, data: await res.json() };
+const sbHeaders = {
+  "apikey": SUPABASE_KEY,
+  "Authorization": `Bearer ${SUPABASE_KEY}`,
+  "Content-Type": "application/json",
+};
+
+async function sbLoadHistory() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/history?select=race_id,data&order=updated_at.desc`, { headers: sbHeaders });
+  if (!res.ok) throw new Error(await res.text());
+  const rows = await res.json();
+  return rows.map(r => r.data);
 }
 
-async function githubGetFile(cfg, path) {
-  const r = await githubRequest(cfg, path, "GET");
-  if (!r.ok) return null;
-  return { content: JSON.parse(atob(r.data.content.replace(/
-/g,""))), sha: r.data.sha };
+async function sbSaveHistory(historyArr) {
+  const rows = historyArr.map(h => ({ race_id: h.raceId, data: h, updated_at: new Date().toISOString() }));
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/history`, {
+    method: "POST",
+    headers: { ...sbHeaders, "Prefer": "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
-async function githubPutFile(cfg, path, content, sha) {
-  const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(content, null, 2))));
-  const body = { message: `update ${path}`, content: encoded };
-  if (sha) body.sha = sha;
-  const r = await githubRequest(cfg, path, "PUT", body);
-  return r.ok;
-}
-
-const GITHUB_CFG_KEY = "keiba_github_cfg";
-function loadGithubCfg() {
-  try { return JSON.parse(localStorage.getItem(GITHUB_CFG_KEY)) || null; } catch { return null; }
-}
-function saveGithubCfg(cfg) {
-  try { localStorage.setItem(GITHUB_CFG_KEY, JSON.stringify(cfg)); } catch {}
+async function sbDeleteHistory(raceId) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/history?race_id=eq.${encodeURIComponent(raceId)}`, {
+    method: "DELETE",
+    headers: sbHeaders,
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
 
 // ============================================================
@@ -988,119 +987,46 @@ function AccumulationTab({ history }) {
 
 
 // ============================================================
-// GITHUB SETTINGS MODAL
+// SUPABASE SYNC BAR
 // ============================================================
-function GitHubSettingsModal({ onClose, onSave, initial }) {
-  const [owner, setOwner] = useState(initial?.owner || "");
-  const [repo, setRepo] = useState(initial?.repo || "");
-  const [token, setToken] = useState(initial?.token || "");
-  const [testing, setTesting] = useState(false);
-  const [testMsg, setTestMsg] = useState("");
-
-  const testConnection = async () => {
-    if (!owner || !repo || !token) { setTestMsg("すべて入力してください"); return; }
-    setTesting(true);
-    setTestMsg("");
-    try {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-        headers: { "Authorization": `token ${token}`, "Accept": "application/vnd.github.v3+json" }
-      });
-      if (res.ok) { setTestMsg("✓ 接続成功"); }
-      else if (res.status === 401) { setTestMsg("✗ Token が無効です"); }
-      else if (res.status === 404) { setTestMsg("✗ リポジトリが見つかりません"); }
-      else { setTestMsg("✗ エラー: " + res.status); }
-    } catch { setTestMsg("✗ 接続失敗（ネットワークエラー）"); }
-    setTesting(false);
-  };
-
-  return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:200, display:"flex", alignItems:"flex-start", justifyContent:"center", overflowY:"auto", padding:"20px 0" }}>
-      <div style={{ background:"#fff", width:"95%", maxWidth:460, border:"1px solid #111" }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 14px", borderBottom:"1px solid #ccc" }}>
-          <span style={{ fontWeight:700 }}>GitHub 保存設定</span>
-          <button onClick={onClose} style={{ padding:"2px 8px", border:"1px solid #111", background:"#fff", cursor:"pointer" }}>✕</button>
-        </div>
-        <div style={{ padding:14 }}>
-          <div style={{ fontSize:12, color:"#666", marginBottom:12, lineHeight:1.6 }}>
-            履歴を GitHub リポジトリに保存します。<br/>
-            Token は <a href="https://github.com/settings/tokens/new" target="_blank" style={{ color:"#111" }}>github.com/settings/tokens/new</a> で作成。<br/>
-            スコープ: <code>repo</code> にチェックを入れてください。
-          </div>
-          {[["GitHubユーザー名", owner, setOwner, "username"], ["リポジトリ名", repo, setRepo, "keiba-engine"], ["Personal Access Token", token, setToken, "ghp_xxxx..."]].map(([label, val, setter, ph]) => (
-            <div key={label} style={{ marginBottom:8 }}>
-              <div style={{ fontSize:11, color:"#666", marginBottom:3 }}>{label}</div>
-              <input
-                style={{ width:"100%", border:"1px solid #ccc", padding:"7px 10px", fontSize:13, boxSizing:"border-box" }}
-                value={val} onChange={e => setter(e.target.value)}
-                placeholder={ph}
-                type={label.includes("Token") ? "password" : "text"}
-              />
-            </div>
-          ))}
-          {testMsg && <div style={{ fontSize:12, padding:"6px 10px", border:"1px solid #ccc", background:"#f9f9f9", marginBottom:8 }}>{testMsg}</div>}
-          <div style={{ display:"flex", gap:8, marginTop:12, flexWrap:"wrap" }}>
-            <button style={{ padding:"8px 14px", border:"none", background:"#111", color:"#fff", fontSize:13, cursor:"pointer" }}
-              onClick={() => { onSave({ owner, repo, token }); onClose(); }}>保存</button>
-            <button style={{ padding:"8px 14px", border:"1px solid #111", background:"#fff", fontSize:13, cursor:"pointer" }}
-              onClick={testConnection} disabled={testing}>{testing ? "確認中..." : "接続テスト"}</button>
-            <button style={{ padding:"8px 14px", border:"1px solid #ccc", background:"#fff", fontSize:13, cursor:"pointer" }}
-              onClick={onClose}>キャンセル</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================
-// GITHUB SYNC BAR
-// ============================================================
-function GitHubSyncBar({ cfg, history, onHistoryLoaded }) {
+function SupabaseSyncBar({ history, onHistoryLoaded }) {
   const [syncing, setSyncing] = useState(false);
   const [msg, setMsg] = useState("");
 
   const showMsg = (m, ms=3000) => { setMsg(m); setTimeout(() => setMsg(""), ms); };
 
   const push = async () => {
-    if (!cfg) { showMsg("先にGitHub設定を行ってください"); return; }
+    if (history.length === 0) { showMsg("保存する履歴がありません"); return; }
     setSyncing(true);
     try {
-      const existing = await githubGetFile(cfg, "keiba_history.json");
-      const ok = await githubPutFile(cfg, "keiba_history.json", history, existing?.sha);
-      showMsg(ok ? "✓ GitHubに保存しました" : "✗ 保存失敗");
-    } catch { showMsg("✗ エラーが発生しました"); }
+      await sbSaveHistory(history);
+      showMsg(`✓ ${history.length}件 保存しました`);
+    } catch(e) { showMsg("✗ 保存失敗: " + e.message); }
     setSyncing(false);
   };
 
   const pull = async () => {
-    if (!cfg) { showMsg("先にGitHub設定を行ってください"); return; }
     setSyncing(true);
     try {
-      const file = await githubGetFile(cfg, "keiba_history.json");
-      if (!file) { showMsg("✗ ファイルが見つかりません（先にプッシュしてください）"); }
+      const data = await sbLoadHistory();
+      if (data.length === 0) { showMsg("データがありません"); }
       else {
-        const data = Array.isArray(file.content) ? file.content : [];
-        // Merge: GitHub wins on conflict
         const merged = [...data];
         history.forEach(h => { if (!merged.find(m => m.raceId === h.raceId)) merged.push(h); });
         onHistoryLoaded(merged);
         showMsg(`✓ ${data.length}件 読み込みました`);
       }
-    } catch { showMsg("✗ エラーが発生しました"); }
+    } catch(e) { showMsg("✗ 読込失敗: " + e.message); }
     setSyncing(false);
   };
 
   return (
-    <div style={{ borderBottom:"1px solid #eee", padding:"8px 16px", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", background:"#fafafa" }}>
-      <span style={{ fontSize:11, color:"#666", marginRight:4 }}>GitHub:</span>
-      <button style={{ padding:"4px 10px", border:"1px solid #111", background:"#fff", fontSize:12, cursor:"pointer" }} onClick={pull} disabled={syncing}>
-        ↓ 読込
-      </button>
-      <button style={{ padding:"4px 10px", border:"none", background:"#111", color:"#fff", fontSize:12, cursor:"pointer" }} onClick={push} disabled={syncing}>
-        ↑ 保存
-      </button>
-      {msg && <span style={{ fontSize:11, color:"#333" }}>{msg}</span>}
+    <div style={{ borderBottom:"1px solid #eee", padding:"6px 16px", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", background:"#fafafa" }}>
+      <span style={{ fontSize:11, color:"#666" }}>クラウド:</span>
+      <button style={{ padding:"4px 10px", border:"1px solid #111", background:"#fff", fontSize:12, cursor:"pointer" }} onClick={pull} disabled={syncing}>↓ 読込</button>
+      <button style={{ padding:"4px 10px", border:"none", background:"#111", color:"#fff", fontSize:12, cursor:"pointer" }} onClick={push} disabled={syncing}>↑ 保存</button>
       {syncing && <span style={{ fontSize:11, color:"#888" }}>処理中...</span>}
+      {msg && <span style={{ fontSize:11, color:"#333" }}>{msg}</span>}
     </div>
   );
 }
@@ -1110,7 +1036,7 @@ function GitHubSyncBar({ cfg, history, onHistoryLoaded }) {
 // ============================================================
 function App() {
   const [tab, setTab] = useState(0);
-  const [history, setHistory] = useState(() => loadStorage(STORAGE_KEYS.history, []));
+  const [history, setHistory] = useState([]);
   const [modules, setModules] = useState(() => {
     const saved = loadStorage(STORAGE_KEYS.modules, null);
     if (!saved) return DEFAULT_MODULES;
@@ -1118,8 +1044,6 @@ function App() {
     const missing = DEFAULT_MODULES.filter(m => !savedIds.has(m.id));
     return missing.length > 0 ? [...missing, ...saved] : saved;
   });
-  const [githubCfg, setGithubCfg] = useState(() => loadGithubCfg());
-  const [showGithubSettings, setShowGithubSettings] = useState(false);
 
   useEffect(() => { saveStorage(STORAGE_KEYS.modules, modules); }, [modules]);
 
@@ -1128,23 +1052,12 @@ function App() {
     saveStorage(STORAGE_KEYS.history, h);
   };
 
-  const saveGithub = (cfg) => {
-    setGithubCfg(cfg);
-    saveGithubCfg(cfg);
-  };
-
   const tabLabels = ["予想", "分析設定", "履歴", "累積分析"];
 
   return (
     <div style={S.app}>
-      <div style={{ ...S.header, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-        <span>🏇 競馬予想エンジン v3</span>
-        <button
-          style={{ fontSize:11, padding:"3px 8px", border:"1px solid #ccc", background: githubCfg ? "#111" : "#fff", color: githubCfg ? "#fff" : "#111", cursor:"pointer" }}
-          onClick={() => setShowGithubSettings(true)}
-        >{githubCfg ? "GitHub ✓" : "GitHub設定"}</button>
-      </div>
-      <GitHubSyncBar cfg={githubCfg} history={history} onHistoryLoaded={handleSetHistory} />
+      <div style={S.header}>🏇 競馬予想エンジン v3</div>
+      <SupabaseSyncBar history={history} onHistoryLoaded={handleSetHistory} />
       <div style={S.tabs}>
         {tabLabels.map((l, i) => (
           <button key={i} style={S.tab(tab === i)} onClick={() => setTab(i)}>{l}</button>
@@ -1154,13 +1067,6 @@ function App() {
       {tab === 1 && <SettingsTab modules={modules} setModules={setModules} />}
       {tab === 2 && <HistoryTab modules={modules} history={history} setHistory={handleSetHistory} />}
       {tab === 3 && <AccumulationTab history={history} />}
-      {showGithubSettings && (
-        <GitHubSettingsModal
-          initial={githubCfg}
-          onSave={saveGithub}
-          onClose={() => setShowGithubSettings(false)}
-        />
-      )}
     </div>
   );
 }
