@@ -330,16 +330,46 @@ function parseResultData(text) {
 }
 
 // Match result order against history entries by horse name overlap; returns best raceId or null
-function matchResultToHistory(order, history) {
+function matchResultToHistory(order, history, meta) {
+  // meta: optional { date, raceName } extracted from result file
   const names = new Set(order.map(o => o.horseName));
-  let best = null, bestScore = 0;
+  let best = null, bestScore = -1;
+
   history.forEach(h => {
-    const overlap = (h.predictions || []).filter(p => names.has(p.horseName)).length;
-    if (overlap > bestScore) { bestScore = overlap; best = h.raceId; }
+    // Score 1: horse name overlap (normalized 0-1)
+    const nameOverlap = (h.predictions || []).filter(p => names.has(p.horseName)).length;
+    const nameScore = nameOverlap / Math.max(names.size, 1);
+
+    // Score 2: date + raceName match bonus
+    let metaScore = 0;
+    if (meta) {
+      if (meta.date && h.raceDate && h.raceDate.includes(meta.date)) metaScore += 0.5;
+      if (meta.raceName && h.raceName && h.raceName.includes(meta.raceName)) metaScore += 0.5;
+    }
+
+    const total = nameScore + metaScore;
+    if (total > bestScore) { bestScore = total; best = h.raceId; }
   });
-  // Require at least 50% overlap
-  if (best && bestScore >= Math.max(3, order.length * 0.5)) return best;
+
+  // Require at least 50% horse name overlap regardless of meta
+  const bestH = history.find(h => h.raceId === best);
+  if (!bestH) return null;
+  const nameOverlap = (bestH.predictions || []).filter(p => names.has(p.horseName)).length;
+  if (nameOverlap >= Math.max(3, order.length * 0.5)) return best;
   return null;
+}
+
+// Extract meta info (date, raceName) from result text/CSV header lines
+function extractResultMeta(text) {
+  const meta = {};
+  const lines = text.split("\n").slice(0, 10).join(" ");
+  // Date pattern like 2026年5月31日 or 2026/05/31
+  const dateM = lines.match(/(\d{4}年\d{1,2}月\d{1,2}日|\d{4}\/\d{2}\/\d{2})/);
+  if (dateM) meta.date = dateM[1];
+  // Race name: look for GⅠ/GⅡ/GⅢ/L/重賞 around text
+  const raceM = lines.match(/([\u30A0-\u30FF\u3040-\u309F\u4E00-\u9FFF]{2,}(?:賞|杯|ステークス|カップ|記念|derby|Derby))/i);
+  if (raceM) meta.raceName = raceM[1];
+  return Object.keys(meta).length > 0 ? meta : null;
 }
 
 // Spearman rank correlation between predicted ranks and finish ranks
@@ -906,6 +936,8 @@ function HistoryTab({ modules, history, setHistory }) {
     setHistory(updated);
     saveStorage(STORAGE_KEYS.history, updated);
     setResultInput(null);
+    // Auto-sync to Supabase
+    sbSaveHistory(updated).catch(() => {});
   };
 
   const exportCSV = (h) => {
@@ -969,13 +1001,15 @@ function HistoryTab({ modules, history, setHistory }) {
 
   const [resultText, setResultText] = useState("");
   const [resultMsg, setResultMsg] = useState("");
+  const [bulkResults, setBulkResults] = useState([]); // [{fileName, matched, raceName, count, status}]
   const [showResultImport, setShowResultImport] = useState(false);
 
-  const importResult = () => {
-    const order = parseResultData(resultText);
-    if (!order) { setResultMsg("✗ 結果データを解析できませんでした"); return; }
-    const raceId = matchResultToHistory(order, history);
-    if (!raceId) { setResultMsg("✗ 対応するレースが履歴に見つかりません（馬名が一致しない）"); return; }
+  const applyOneResult = (text, currentHistory) => {
+    const order = parseResultData(text);
+    if (!order) return { ok: false, reason: "解析失敗", updated: currentHistory };
+    const meta = extractResultMeta(text);
+    const raceId = matchResultToHistory(order, currentHistory, meta);
+    if (!raceId) return { ok: false, reason: "対応レースなし", updated: currentHistory };
     const sorted = [...order].sort((a, b) => a.finishRank - b.finishRank);
     const result = {
       first: sorted[0]?.horseName || "",
@@ -983,14 +1017,57 @@ function HistoryTab({ modules, history, setHistory }) {
       third: sorted[2]?.horseName || "",
       order: sorted,
     };
-    const updated = history.map(h => h.raceId === raceId ? { ...h, result, resultEntered: true } : h);
+    const race = currentHistory.find(h => h.raceId === raceId);
+    const updated = currentHistory.map(h => h.raceId === raceId ? { ...h, result, resultEntered: true } : h);
+    return { ok: true, raceName: race?.raceName || raceId, count: sorted.length, updated };
+  };
+
+  const importResult = () => {
+    const { ok, reason, raceName, count, updated } = applyOneResult(resultText, history);
+    if (!ok) { setResultMsg("✗ " + reason); return; }
     setHistory(updated);
     saveStorage(STORAGE_KEYS.history, updated);
-    const race = history.find(h => h.raceId === raceId);
-    setResultMsg(`✓ 「${race?.raceName}」に結果を反映しました（${sorted.length}頭）`);
+    setResultMsg(`✓ 「${raceName}」に結果を反映しました（${count}頭）`);
     setResultText("");
-    // Auto-sync to Supabase
     sbSaveHistory(updated).catch(() => {});
+  };
+
+  const importResultFiles = (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    e.target.value = "";
+    setBulkResults([]);
+    setResultMsg("");
+
+    let loaded = 0;
+    const texts = new Array(files.length);
+    files.forEach((file, i) => {
+      const reader = new FileReader();
+      reader.onload = ev => {
+        texts[i] = { name: file.name, text: ev.target.result };
+        loaded++;
+        if (loaded < files.length) return;
+        // All loaded — process sequentially, chaining updated history
+        let cur = history;
+        const log = [];
+        texts.forEach(({ name, text }) => {
+          const { ok, reason, raceName, count, updated } = applyOneResult(text, cur);
+          if (ok) { cur = updated; log.push({ name, ok: true, raceName, count }); }
+          else { log.push({ name, ok: false, reason }); }
+        });
+        const successCount = log.filter(l => l.ok).length;
+        setBulkResults(log);
+        if (successCount > 0) {
+          setHistory(cur);
+          saveStorage(STORAGE_KEYS.history, cur);
+          sbSaveHistory(cur).catch(() => {});
+          setResultMsg(`✓ ${successCount}/${files.length}件 反映しました`);
+        } else {
+          setResultMsg(`✗ 反映できたレースが0件でした`);
+        }
+      };
+      reader.readAsText(file, "utf-8");
+    });
   };
 
   const importResultFile = (e) => {
@@ -1034,18 +1111,41 @@ function HistoryTab({ modules, history, setHistory }) {
         </div>
         {showResultImport && (
           <div style={{ marginTop: 10 }}>
-            <div style={{ fontSize: 11, color: "#888", marginBottom: 6 }}>
-              結果CSV（着順・馬番・馬名の列を含む）またはJRA結果テキストを貼り付け。馬名から自動でレースを特定して反映します。
+            <div style={{ fontSize: 11, color: "#888", marginBottom: 8 }}>
+              結果CSV（着順・馬番・馬名）またはJRA結果テキスト。馬名＋開催日・レース名で自動照合します。
             </div>
-            <textarea style={{ ...S.textarea, minHeight: 80 }} value={resultText} onChange={e => setResultText(e.target.value)}
-              placeholder={"着順,馬番,馬名\n1,17,ロブチェン\n2,13,パントルナイーフ\n..."} />
+
+            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 4 }}>複数ファイル一括取込</div>
+            <label style={{ ...S.btnSmallFill, display: "inline-block", marginBottom: 8 }}>
+              ファイル選択（複数可）
+              <input type="file" accept=".csv,.txt" multiple style={{ display: "none" }} onChange={importResultFiles} />
+            </label>
+            {bulkResults.length > 0 && (
+              <div style={{ border: "1px solid #eee", marginBottom: 8 }}>
+                {bulkResults.map((r, i) => (
+                  <div key={i} style={{ ...S.row, justifyContent: "space-between", padding: "5px 10px", borderBottom: "1px solid #f5f5f5", fontSize: 11 }}>
+                    <span style={{ color: "#666", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
+                    {r.ok
+                      ? <span style={{ color: "#333", marginLeft: 8, whiteSpace: "nowrap" }}>✓ {r.raceName}（{r.count}頭）</span>
+                      : <span style={{ color: "#999", marginLeft: 8, whiteSpace: "nowrap" }}>✗ {r.reason}</span>
+                    }
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ ...S.divider }} />
+            <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 4 }}>テキスト貼り付け（1レース）</div>
+            <textarea style={{ ...S.textarea, minHeight: 70 }} value={resultText} onChange={e => setResultText(e.target.value)}
+              placeholder={"着順,馬番,馬名\n1,17,ロブチェン\n..."} />
             <div style={{ ...S.row, gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-              <button style={S.btnSmallFill} onClick={importResult}>結果を反映</button>
+              <button style={S.btnSmallFill} onClick={importResult}>反映</button>
               <label style={{ ...S.btnSmall, display: "inline-block" }}>
-                ファイル選択
+                ファイル（1件）
                 <input type="file" accept=".csv,.txt" style={{ display: "none" }} onChange={importResultFile} />
               </label>
             </div>
+
             {resultMsg && <div style={{ fontSize: 12, marginTop: 8, padding: "6px 10px", border: "1px solid #ccc", background: "#f9f9f9" }}>{resultMsg}</div>}
           </div>
         )}
