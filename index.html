@@ -287,6 +287,88 @@ const STORAGE_KEYS = {
 };
 
 // ============================================================
+// RESULT PARSING & STATS
+// ============================================================
+
+// Parse result CSV/text: extracts rows of {finishRank, horseNumber, horseName}
+// Accepts CSV with headers containing 着順/馬番/馬名, or tab/space separated race result text
+function parseResultData(text) {
+  const lines = text.trim().split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+
+  // Try CSV with headers first
+  const firstLine = lines[0];
+  if (firstLine.includes("着順") && (firstLine.includes("馬名") || firstLine.includes("馬番"))) {
+    const delim = firstLine.includes(",") ? "," : "\t";
+    const headers = firstLine.split(delim).map(h => h.trim());
+    const idxRank = headers.findIndex(h => h.includes("着順"));
+    const idxNum = headers.findIndex(h => h === "馬番" || h.includes("馬番"));
+    const idxName = headers.findIndex(h => h.includes("馬名"));
+    const order = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cells = lines[i].split(delim).map(c => c.trim());
+      const rank = parseInt(cells[idxRank]);
+      if (isNaN(rank)) continue;
+      order.push({
+        finishRank: rank,
+        horseNumber: idxNum >= 0 ? cells[idxNum] : "",
+        horseName: idxName >= 0 ? cells[idxName] : "",
+      });
+    }
+    return order.length > 0 ? order : null;
+  }
+
+  // Fallback: free-text lines like "1 枠8桃 17 ロブチェン 牡3 ..."
+  const order = [];
+  for (const line of lines) {
+    const m = line.match(/^(\d{1,2})\s+(?:枠\d+\S*\s+)?(\d{1,2})\s+(\S+)/);
+    if (m) {
+      order.push({ finishRank: parseInt(m[1]), horseNumber: m[2], horseName: m[3] });
+    }
+  }
+  return order.length >= 3 ? order : null;
+}
+
+// Match result order against history entries by horse name overlap; returns best raceId or null
+function matchResultToHistory(order, history) {
+  const names = new Set(order.map(o => o.horseName));
+  let best = null, bestScore = 0;
+  history.forEach(h => {
+    const overlap = (h.predictions || []).filter(p => names.has(p.horseName)).length;
+    if (overlap > bestScore) { bestScore = overlap; best = h.raceId; }
+  });
+  // Require at least 50% overlap
+  if (best && bestScore >= Math.max(3, order.length * 0.5)) return best;
+  return null;
+}
+
+// Spearman rank correlation between predicted ranks and finish ranks
+function spearmanCorrelation(pairs) {
+  // pairs: [{pred, actual}]
+  const n = pairs.length;
+  if (n < 3) return null;
+  const dSum = pairs.reduce((s, p) => s + Math.pow(p.pred - p.actual, 2), 0);
+  return 1 - (6 * dSum) / (n * (n * n - 1));
+}
+
+// Compute correlation for one history entry with full result order
+function raceCorrelation(h) {
+  if (!h.result || !h.result.order || !h.predictions) return null;
+  const finishMap = {};
+  h.result.order.forEach(o => { finishMap[o.horseName] = o.finishRank; });
+  const pairs = h.predictions
+    .filter(p => finishMap[p.horseName] !== undefined)
+    .map(p => ({ pred: p.rank, actual: finishMap[p.horseName] }));
+  return spearmanCorrelation(pairs);
+}
+
+// Group history entries by module configuration signature
+function moduleSignature(h) {
+  if (!h.modules) return "不明";
+  return h.modules.map(m => m.name).sort().join(" + ");
+}
+
+// ============================================================
 // SUPABASE STORAGE
 // ============================================================
 const SUPABASE_URL = "https://kxedmjixqswrdboqyupg.supabase.co";
@@ -410,161 +492,239 @@ function FormulaBuilder({ formula, onChange, modules, currentId }) {
 // TAB 1: 予想
 // ============================================================
 function PredictionTab({ modules, history, setHistory }) {
+  const [races, setRaces] = useState([]); // [{key, raceInfo, csvText, csvData, results, saved}]
   const [csvText, setCsvText] = useState("");
-  const [csvData, setCsvData] = useState(null);
-  const [results, setResults] = useState(null);
-  const [raceInfo, setRaceInfo] = useState(null);
-  const [expanded, setExpanded] = useState({});
   const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [expanded, setExpanded] = useState({}); // "raceKey-rowIdx" -> bool
+  const [openRace, setOpenRace] = useState(null); // which race card is open
   const [overwriteConfirm, setOverwriteConfirm] = useState(false);
   const fileRef = useRef();
 
-  const loadCSV = () => {
-    const parsed = parseCSV(csvText);
-    if (!parsed) { setError("CSVの形式が正しくありません"); return; }
-    setError("");
-    setCsvData(parsed);
+  const makeRace = (text) => {
+    const parsed = parseCSV(text);
+    if (!parsed) return null;
     const first = parsed.rows[0] || {};
-    setRaceInfo({
-      raceId: first.race_id || first.RaceID || first["レースID"] || (first["開催日"] + "_" + first["レース番号"]) || String(Date.now()),
-      date: first.race_date || first.開催日 || "—",
-      name: first.race_name || first.レース名 || "—",
-      place: first.place || first.開催場 || "—",
-      count: parsed.rows.length,
-    });
-    setResults(null);
-    setSaved(false);
-  };
-
-  const runPrediction = () => {
-    if (!csvData) { setError("先にCSVを読み込んでください"); return; }
-    const res = runAnalysis(csvData, modules);
-    setResults(res);
-    setSaved(false);
-  };
-
-  const saveCSV = () => {
-    if (!csvText) return;
-    const blob = new Blob([csvText], { type: "text/csv" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `race_${raceInfo?.raceId || "data"}.csv`;
-    a.click();
-  };
-
-  const savePrediction = () => {
-    if (!results || !raceInfo) { setError("予想結果がありません"); return; }
-    const raceId = raceInfo.raceId;
-    const entry = {
-      raceId,
-      raceDate: raceInfo.date,
-      raceName: raceInfo.name,
-      racePlace: raceInfo.place,
-      csvText,
-      predictions: results.map(r => ({
-        rank: r.rank,
-        horseName: r.row["馬名"] || r.row.horse_name || "—",
-        horseNumber: r.row["馬番"] || r.row.horse_number || "—",
-        total: r.total,
-        moduleScores: r.moduleScores,
-      })),
-      modules: modules.filter(m => m.enabled).map(m => ({ name: m.name, outputVar: m.outputVar, formula: m.formula })),
-      resultEntered: false,
-      result: null,
-      savedAt: new Date().toISOString(),
+    const raceId = first.race_id || first.RaceID || first["レースID"] || ((first["開催日"] || "") + "_" + (first["開催場"] || "") + "_" + (first["レース番号"] || "")) || String(Date.now());
+    return {
+      key: raceId + "_" + Math.random().toString(36).slice(2,6),
+      raceInfo: {
+        raceId,
+        date: first.race_date || first.開催日 || "—",
+        name: first.race_name || first.レース名 || "—",
+        place: first.place || first.開催場 || "—",
+        count: parsed.rows.length,
+      },
+      csvText: text,
+      csvData: parsed,
+      results: null,
+      saved: false,
     };
-    const existing = history.find(h => h.raceId === raceId);
-    if (existing && !overwriteConfirm) {
+  };
+
+  const loadFromText = () => {
+    if (!csvText.trim()) { setError("CSVを入力してください"); return; }
+    const race = makeRace(csvText);
+    if (!race) { setError("CSVの形式が正しくありません"); return; }
+    setError("");
+    setRaces(prev => [...prev, race]);
+    setCsvText("");
+    setOpenRace(race.key);
+  };
+
+  const loadFromFiles = (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length === 0) return;
+    setError("");
+    let loaded = 0;
+    const newRaces = [];
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const race = makeRace(ev.target.result);
+        if (race) newRaces.push(race);
+        loaded++;
+        if (loaded === files.length) {
+          if (newRaces.length === 0) { setError("読み込めるCSVがありませんでした"); }
+          setRaces(prev => [...prev, ...newRaces]);
+          if (newRaces.length === 1) setOpenRace(newRaces[0].key);
+        }
+      };
+      reader.readAsText(file, "utf-8");
+    });
+    e.target.value = "";
+  };
+
+  const predictOne = (key) => {
+    setRaces(prev => prev.map(r => r.key === key ? { ...r, results: runAnalysis(r.csvData, modules), saved: false } : r));
+  };
+
+  const predictAll = () => {
+    setRaces(prev => prev.map(r => ({ ...r, results: runAnalysis(r.csvData, modules), saved: false })));
+  };
+
+  const buildEntry = (r) => ({
+    raceId: r.raceInfo.raceId,
+    raceDate: r.raceInfo.date,
+    raceName: r.raceInfo.name,
+    racePlace: r.raceInfo.place,
+    csvText: r.csvText,
+    predictions: r.results.map(x => ({
+      rank: x.rank,
+      horseName: x.row["馬名"] || x.row.horse_name || "—",
+      horseNumber: x.row["馬番"] || x.row.horse_number || "—",
+      total: x.total,
+      moduleScores: x.moduleScores,
+    })),
+    modules: modules.filter(m => m.enabled).map(m => ({ name: m.name, outputVar: m.outputVar, formula: m.formula })),
+    resultEntered: false,
+    result: null,
+    savedAt: new Date().toISOString(),
+  });
+
+  const saveAll = () => {
+    const ready = races.filter(r => r.results && !r.saved);
+    if (ready.length === 0) { setError("保存できる予想がありません（先に予想実行してください）"); return; }
+    const dup = ready.filter(r => history.find(h => h.raceId === r.raceInfo.raceId));
+    if (dup.length > 0 && !overwriteConfirm) {
+      setError(`${dup.length}件は履歴に存在します。もう一度「一括保存」を押すと上書きします`);
       setOverwriteConfirm(true);
       return;
     }
-    const updated = existing
-      ? history.map(h => h.raceId === raceId ? entry : h)
-      : [entry, ...history];
+    let updated = [...history];
+    ready.forEach(r => {
+      const entry = buildEntry(r);
+      const idx = updated.findIndex(h => h.raceId === entry.raceId);
+      if (idx >= 0) updated[idx] = entry;
+      else updated = [entry, ...updated];
+    });
     setHistory(updated);
     saveStorage(STORAGE_KEYS.history, updated);
-    setSaved(true);
+    setRaces(prev => prev.map(r => ready.find(x => x.key === r.key) ? { ...r, saved: true } : r));
+    setError("");
     setOverwriteConfirm(false);
   };
 
-  const toggleRow = (i) => setExpanded(p => ({ ...p, [i]: !p[i] }));
+  const saveOne = (key) => {
+    const r = races.find(x => x.key === key);
+    if (!r || !r.results) return;
+    const entry = buildEntry(r);
+    const idx = history.findIndex(h => h.raceId === entry.raceId);
+    const updated = idx >= 0
+      ? history.map((h, i) => i === idx ? entry : h)
+      : [entry, ...history];
+    setHistory(updated);
+    saveStorage(STORAGE_KEYS.history, updated);
+    setRaces(prev => prev.map(x => x.key === key ? { ...x, saved: true } : x));
+  };
+
+  const removeRace = (key) => {
+    setRaces(prev => prev.filter(r => r.key !== key));
+    if (openRace === key) setOpenRace(null);
+  };
+
+  const toggleRow = (raceKey, i) => {
+    const k = raceKey + "-" + i;
+    setExpanded(p => ({ ...p, [k]: !p[k] }));
+  };
+
+  const allPredicted = races.length > 0 && races.every(r => r.results);
+  const unsavedCount = races.filter(r => r.results && !r.saved).length;
 
   return (
     <div style={S.page}>
       <div style={S.section}>
-        <label style={S.label}>CSVテキスト貼り付け</label>
-        <textarea style={S.textarea} value={csvText} onChange={e => setCsvText(e.target.value)} placeholder={"race_id,race_date,race_name,...\n1001,2024/06/09,東京10R,東京,..."} />
-        <div style={{ marginTop: 6, fontSize: 11, color: "#888" }}>またはファイル選択: <input ref={fileRef} type="file" accept=".csv" style={{ fontSize: 12 }} onChange={e => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const reader = new FileReader();
-          reader.onload = ev => setCsvText(ev.target.result);
-          reader.readAsText(file, "utf-8");
-        }} /></div>
-      </div>
-      {error && <div style={S.error}>{error}</div>}
-      <div style={{ ...S.row, gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
-        <button style={S.btnPrimary} onClick={loadCSV}>CSV読込</button>
-        <button style={S.btn} onClick={runPrediction}>予想実行</button>
-        <button style={results ? S.btnPrimary : S.btn} onClick={savePrediction}>
-          {saved ? "保存済み ✓" : overwriteConfirm ? "もう一度押して上書き" : "予想保存"}
-        </button>
-        <button style={S.btn} onClick={saveCSV}>CSV保存</button>
+        <label style={S.label}>CSVテキスト貼り付け（1レース分）</label>
+        <textarea style={{ ...S.textarea, minHeight: 80 }} value={csvText} onChange={e => setCsvText(e.target.value)} placeholder={"開催日,開催場,...\n2026年5月31日,東京,..."} />
+        <div style={{ ...S.row, gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+          <button style={S.btn} onClick={loadFromText}>テキストから追加</button>
+          <label style={{ ...S.btn, display: "inline-block" }}>
+            ファイル選択（複数可）
+            <input ref={fileRef} type="file" accept=".csv" multiple style={{ display: "none" }} onChange={loadFromFiles} />
+          </label>
+        </div>
       </div>
 
-      {raceInfo && (
-        <div style={{ ...S.card, marginBottom: 16 }}>
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>レース情報</div>
-          {[["RaceID", raceInfo.raceId], ["開催日", raceInfo.date], ["レース名", raceInfo.name], ["開催場", raceInfo.place], ["頭数", raceInfo.count + "頭"]].map(([k, v]) => (
-            <div key={k} style={{ ...S.row, justifyContent: "space-between", borderTop: "1px solid #eee", padding: "4px 0" }}>
-              <span style={{ color: "#666", fontSize: 12 }}>{k}</span>
-              <span style={{ fontWeight: 500 }}>{v}</span>
-            </div>
-          ))}
+      {error && <div style={S.error}>{error}</div>}
+
+      {races.length > 0 && (
+        <div style={{ ...S.row, gap: 8, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <button style={S.btnPrimary} onClick={predictAll}>一括予想 ({races.length}件)</button>
+          <button style={unsavedCount > 0 ? S.btnPrimary : S.btn} onClick={saveAll}>
+            {overwriteConfirm ? "もう一度押して上書き" : `一括保存${unsavedCount > 0 ? ` (${unsavedCount}件)` : ""}`}
+          </button>
+          <button style={S.btn} onClick={() => { setRaces([]); setOpenRace(null); setError(""); }}>全クリア</button>
         </div>
       )}
 
-      {results && (
-        <div>
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>予想結果</div>
-          <div style={{ ...S.row, fontWeight: 700, fontSize: 12, padding: "4px 0", borderBottom: "1px solid #ccc" }}>
-            <span style={{ width: 32 }}>順位</span>
-            <span style={{ width: 36 }}>馬番</span>
-            <span style={{ flex: 1 }}>馬名</span>
-            <span style={{ width: 70, textAlign: "right" }}>総合スコア</span>
-          </div>
-          {results.map((r, i) => (
-            <div key={i}>
-              <div style={{ ...S.row, padding: "8px 0", borderBottom: "1px solid #eee", cursor: "pointer" }} onClick={() => toggleRow(i)}>
-                <span style={{ width: 32, fontWeight: 700, fontSize: 15 }}>{r.rank}</span>
-                <span style={{ width: 36 }}>{r.row.horse_number || r.row.馬番 || "—"}</span>
-                <span style={{ flex: 1 }}>{r.row.horse_name || r.row.馬名 || "—"}</span>
-                <span style={{ width: 70, textAlign: "right", fontFamily: "monospace" }}>{r.total.toFixed(2)}</span>
-                <span style={{ fontSize: 11, color: "#999", marginLeft: 4 }}>{expanded[i] ? "▲" : "▼"}</span>
+      {races.length === 0 && (
+        <div style={{ color: "#888", fontSize: 13, textAlign: "center", padding: "30px 0" }}>
+          CSVを追加するとここにレース一覧が表示されます
+        </div>
+      )}
+
+      {races.map(r => (
+        <div key={r.key} style={{ ...S.card, padding: 0, marginBottom: 10 }}>
+          <div style={{ padding: "10px 12px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}
+            onClick={() => setOpenRace(openRace === r.key ? null : r.key)}>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>{r.raceInfo.name}</div>
+              <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>
+                {r.raceInfo.date} · {r.raceInfo.place} · {r.raceInfo.count}頭
               </div>
-              {expanded[i] && (
-                <div style={{ background: "#f9f9f9", border: "1px solid #eee", padding: "8px 12px", marginBottom: 4, fontSize: 12 }}>
-                  <div style={{ fontWeight: 700, marginBottom: 6 }}>モジュール別スコア</div>
-                  {Object.entries(r.moduleScores).map(([k, v]) => (
-                    <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "2px 0" }}>
-                      <span style={{ color: "#555" }}>{k}</span>
-                      <span style={{ fontFamily: "monospace" }}>{Number(v).toFixed(4)}</span>
-                    </div>
-                  ))}
-                  <div style={S.divider} />
-                  <div style={{ fontWeight: 700, marginBottom: 4 }}>使用モジュール</div>
-                  {modules.filter(m => m.enabled).map(m => (
-                    <div key={m.id} style={{ fontSize: 11, marginBottom: 2 }}>
-                      <span style={S.tag}>{m.name}</span> {m.outputVar}
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {r.saved && <span style={{ fontSize: 11, border: "1px solid #111", padding: "1px 6px" }}>保存済</span>}
+              {r.results && !r.saved && <span style={{ fontSize: 11, border: "1px solid #999", padding: "1px 6px", color: "#666" }}>予想済</span>}
+              <span style={{ fontSize: 11, color: "#999" }}>{openRace === r.key ? "▲" : "▼"}</span>
+            </div>
+          </div>
+
+          {openRace === r.key && (
+            <div style={{ borderTop: "1px solid #eee", padding: "10px 12px" }}>
+              <div style={{ ...S.row, gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+                <button style={S.btnSmallFill} onClick={() => predictOne(r.key)}>予想実行</button>
+                <button style={S.btnSmall} onClick={() => saveOne(r.key)} disabled={!r.results}>
+                  {r.saved ? "保存済 ✓" : "保存"}
+                </button>
+                <button style={S.btnSmall} onClick={() => removeRace(r.key)}>一覧から削除</button>
+              </div>
+
+              {r.results && (
+                <div>
+                  <div style={{ ...S.row, fontWeight: 700, fontSize: 12, padding: "4px 0", borderBottom: "1px solid #ccc" }}>
+                    <span style={{ width: 32 }}>順位</span>
+                    <span style={{ width: 36 }}>馬番</span>
+                    <span style={{ flex: 1 }}>馬名</span>
+                    <span style={{ width: 70, textAlign: "right" }}>スコア</span>
+                  </div>
+                  {r.results.map((x, i) => (
+                    <div key={i}>
+                      <div style={{ ...S.row, padding: "7px 0", borderBottom: "1px solid #eee", cursor: "pointer" }} onClick={() => toggleRow(r.key, i)}>
+                        <span style={{ width: 32, fontWeight: 700, fontSize: 14 }}>{x.rank}</span>
+                        <span style={{ width: 36 }}>{x.row["馬番"] || x.row.horse_number || "—"}</span>
+                        <span style={{ flex: 1, fontSize: 13 }}>{x.row["馬名"] || x.row.horse_name || "—"}</span>
+                        <span style={{ width: 70, textAlign: "right", fontFamily: "monospace", fontSize: 12 }}>{x.total.toFixed(1)}</span>
+                        <span style={{ fontSize: 10, color: "#999", marginLeft: 4 }}>{expanded[r.key + "-" + i] ? "▲" : "▼"}</span>
+                      </div>
+                      {expanded[r.key + "-" + i] && (
+                        <div style={{ background: "#f9f9f9", border: "1px solid #eee", padding: "8px 12px", marginBottom: 4, fontSize: 12 }}>
+                          <div style={{ fontWeight: 700, marginBottom: 4 }}>モジュール別スコア</div>
+                          {Object.entries(x.moduleScores).map(([k, v]) => (
+                            <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "2px 0" }}>
+                              <span style={{ color: "#555" }}>{k}</span>
+                              <span style={{ fontFamily: "monospace" }}>{Number(v).toFixed(4)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
             </div>
-          ))}
+          )}
         </div>
-      )}
+      ))}
     </div>
   );
 }
@@ -801,6 +961,39 @@ function HistoryTab({ modules, history, setHistory }) {
     e.target.value = "";
   };
 
+  const [resultText, setResultText] = useState("");
+  const [resultMsg, setResultMsg] = useState("");
+  const [showResultImport, setShowResultImport] = useState(false);
+
+  const importResult = () => {
+    const order = parseResultData(resultText);
+    if (!order) { setResultMsg("✗ 結果データを解析できませんでした"); return; }
+    const raceId = matchResultToHistory(order, history);
+    if (!raceId) { setResultMsg("✗ 対応するレースが履歴に見つかりません（馬名が一致しない）"); return; }
+    const sorted = [...order].sort((a, b) => a.finishRank - b.finishRank);
+    const result = {
+      first: sorted[0]?.horseName || "",
+      second: sorted[1]?.horseName || "",
+      third: sorted[2]?.horseName || "",
+      order: sorted,
+    };
+    const updated = history.map(h => h.raceId === raceId ? { ...h, result, resultEntered: true } : h);
+    setHistory(updated);
+    saveStorage(STORAGE_KEYS.history, updated);
+    const race = history.find(h => h.raceId === raceId);
+    setResultMsg(`✓ 「${race?.raceName}」に結果を反映しました（${sorted.length}頭）`);
+    setResultText("");
+  };
+
+  const importResultFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => { setResultText(ev.target.result); };
+    reader.readAsText(file, "utf-8");
+    e.target.value = "";
+  };
+
   const importExportBar = (
     <div style={{ ...S.row, gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
       <button style={S.btnSmall} onClick={exportAll}>履歴エクスポート (JSON)</button>
@@ -825,6 +1018,31 @@ function HistoryTab({ modules, history, setHistory }) {
   return (
     <div style={S.page}>
       {importExportBar}
+
+      <div style={{ ...S.card, marginBottom: 14 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer" }} onClick={() => setShowResultImport(!showResultImport)}>
+          <span style={{ fontWeight: 700, fontSize: 13 }}>レース結果の自動取込</span>
+          <span style={{ fontSize: 11, color: "#999" }}>{showResultImport ? "▲" : "▼"}</span>
+        </div>
+        {showResultImport && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 11, color: "#888", marginBottom: 6 }}>
+              結果CSV（着順・馬番・馬名の列を含む）またはJRA結果テキストを貼り付け。馬名から自動でレースを特定して反映します。
+            </div>
+            <textarea style={{ ...S.textarea, minHeight: 80 }} value={resultText} onChange={e => setResultText(e.target.value)}
+              placeholder={"着順,馬番,馬名\n1,17,ロブチェン\n2,13,パントルナイーフ\n..."} />
+            <div style={{ ...S.row, gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+              <button style={S.btnSmallFill} onClick={importResult}>結果を反映</button>
+              <label style={{ ...S.btnSmall, display: "inline-block" }}>
+                ファイル選択
+                <input type="file" accept=".csv,.txt" style={{ display: "none" }} onChange={importResultFile} />
+              </label>
+            </div>
+            {resultMsg && <div style={{ fontSize: 12, marginTop: 8, padding: "6px 10px", border: "1px solid #ccc", background: "#f9f9f9" }}>{resultMsg}</div>}
+          </div>
+        )}
+      </div>
+
       <div style={{ fontWeight: 700, marginBottom: 10 }}>履歴一覧 ({history.length}件)</div>
       {history.map(h => (
         <div key={h.raceId} style={{ ...S.card, padding: 0 }}>
@@ -933,25 +1151,39 @@ function AccumulationTab({ history }) {
     const result = h.result;
     const winners = [result.first, result.second, result.third].filter(Boolean);
     const top1 = preds.find(p => p.rank === 1);
-    if (top1 && winners.includes(top1.horseName)) pred1Win++;
+    if (top1 && result.first === top1.horseName) pred1Win++;
     const top3Names = preds.filter(p => p.rank <= 3).map(p => p.horseName);
-    if (winners.some(w => top3Names.includes(w))) pred3Win++;
+    if (top3Names.includes(result.first)) pred3Win++;
     const top5Names = preds.filter(p => p.rank <= 5).map(p => p.horseName);
-    if (winners.some(w => top5Names.includes(w))) pred5Win++;
-    // capture
+    if (top5Names.includes(result.first)) pred5Win++;
     winners.forEach(w => {
       const found = preds.find(p => p.horseName === w);
       if (found) { if (found.rank <= 3) top3Capture++; if (found.rank <= 5) top5Capture++; }
     });
-    // avg rank error
-    winners.forEach(w => {
-      const found = preds.find(p => p.horseName === w);
-      if (found) rankErrors.push(found.rank);
-    });
+    const winFound = preds.find(p => p.horseName === result.first);
+    if (winFound) rankErrors.push(winFound.rank);
   });
 
   const pct = (n, d) => d === 0 ? "—" : (n / d * 100).toFixed(1) + "%";
   const avgErr = rankErrors.length > 0 ? (rankErrors.reduce((a, b) => a + b, 0) / rankErrors.length).toFixed(1) : "—";
+
+  // Correlation analysis (requires full result order)
+  const withOrder = entered.filter(h => h.result.order && h.result.order.length >= 3);
+  const correlations = withOrder.map(h => ({ h, corr: raceCorrelation(h) })).filter(x => x.corr !== null);
+  const avgCorr = correlations.length > 0
+    ? (correlations.reduce((s, x) => s + x.corr, 0) / correlations.length)
+    : null;
+
+  // Group by module configuration
+  const groups = {};
+  correlations.forEach(({ h, corr }) => {
+    const sig = moduleSignature(h);
+    if (!groups[sig]) groups[sig] = { corrs: [], wins: 0, races: 0 };
+    groups[sig].corrs.push(corr);
+    groups[sig].races++;
+    const top1 = (h.predictions || []).find(p => p.rank === 1);
+    if (top1 && h.result.first === top1.horseName) groups[sig].wins++;
+  });
 
   const stats = [
     ["保存レース数", total + "件"],
@@ -959,32 +1191,188 @@ function AccumulationTab({ history }) {
     ["予想1位勝率", pct(pred1Win, enteredCount)],
     ["予想TOP3勝率", pct(pred3Win, enteredCount)],
     ["予想TOP5勝率", pct(pred5Win, enteredCount)],
-    ["TOP3内勝ち馬捕捉率", pct(top3Capture, entered.length * 3)],
-    ["TOP5内勝ち馬捕捉率", pct(top5Capture, entered.length * 3)],
-    ["勝ち馬平均予想順位", avgErr === "—" ? "—" : avgErr + "位"],
+    ["TOP3内好走馬捕捉率", pct(top3Capture, entered.length * 3)],
+    ["TOP5内好走馬捕捉率", pct(top5Capture, entered.length * 3)],
+    ["勝ち馬の平均予想順位", avgErr === "—" ? "—" : avgErr + "位"],
   ];
+
+  const corrLabel = (c) => {
+    if (c === null) return "—";
+    const v = c.toFixed(3);
+    if (c >= 0.7) return v + "（強い相関）";
+    if (c >= 0.4) return v + "（中程度）";
+    if (c >= 0.2) return v + "（弱い）";
+    return v + "（ほぼ無相関）";
+  };
 
   return (
     <div style={S.page}>
       <div style={{ fontWeight: 700, marginBottom: 12 }}>累積分析</div>
       {enteredCount === 0 && (
-        <div style={{ color: "#888", fontSize: 13, marginBottom: 16 }}>結果入力済みレースがありません。履歴タブで結果を入力してください。</div>
+        <div style={{ color: "#888", fontSize: 13, marginBottom: 16 }}>結果入力済みレースがありません。履歴タブで結果を取り込んでください。</div>
       )}
-      <div style={S.card}>
+
+      <div style={{ ...S.card, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>的中サマリー</div>
         {stats.map(([k, v]) => (
-          <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid #eee" }}>
+          <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid #eee" }}>
             <span style={{ fontSize: 13, color: "#444" }}>{k}</span>
-            <span style={{ fontWeight: 700, fontSize: 15, fontFamily: "monospace" }}>{v}</span>
+            <span style={{ fontWeight: 700, fontSize: 14, fontFamily: "monospace" }}>{v}</span>
           </div>
         ))}
       </div>
-      <div style={{ marginTop: 16, fontSize: 12, color: "#888" }}>
-        ※ 回収率・3連複/3連単的中率は将来追加予定
+
+      <div style={{ ...S.card, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>予想順位×着順 相関分析</div>
+        <div style={{ fontSize: 11, color: "#888", marginBottom: 8 }}>
+          スピアマン順位相関。1.0に近いほど予想順位どおりに決着している。全着順データがあるレースのみ対象（{withOrder.length}件）。
+        </div>
+        <div style={{ ...S.row, justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid #eee" }}>
+          <span style={{ fontSize: 13, color: "#444" }}>全体平均相関</span>
+          <span style={{ fontWeight: 700, fontSize: 14, fontFamily: "monospace" }}>{corrLabel(avgCorr)}</span>
+        </div>
+        {correlations.slice(0, 10).map(({ h, corr }) => (
+          <div key={h.raceId} style={{ ...S.row, justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #f3f3f3" }}>
+            <span style={{ fontSize: 12, color: "#666", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.raceName}</span>
+            <span style={{ fontFamily: "monospace", fontSize: 13 }}>{corr.toFixed(3)}</span>
+          </div>
+        ))}
+      </div>
+
+      {Object.keys(groups).length > 0 && (
+        <div style={{ ...S.card, marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>モジュール構成別パフォーマンス</div>
+          <div style={{ fontSize: 11, color: "#888", marginBottom: 8 }}>
+            分析設定を変えて予想したレースを構成ごとに比較。相関が高い構成ほど予想精度が高い。
+          </div>
+          {Object.entries(groups).map(([sig, g]) => {
+            const avg = g.corrs.reduce((a, b) => a + b, 0) / g.corrs.length;
+            return (
+              <div key={sig} style={{ borderBottom: "1px solid #eee", padding: "8px 0" }}>
+                <div style={{ fontSize: 11, color: "#555", marginBottom: 4 }}>{sig}</div>
+                <div style={{ ...S.row, gap: 14, fontSize: 12 }}>
+                  <span>件数: <b>{g.races}</b></span>
+                  <span>平均相関: <b style={{ fontFamily: "monospace" }}>{avg.toFixed(3)}</b></span>
+                  <span>1位勝率: <b>{pct(g.wins, g.races)}</b></span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: "#888" }}>
+        ヒント: 分析設定でモジュールや式を変更→履歴から「再分析」→結果と比較することで、どの構成が相関を上げるか検証できます。
       </div>
     </div>
   );
 }
 
+// ============================================================
+// TAB 5: データ管理 (Supabase)
+// ============================================================
+function DataTab({ history, onHistoryLoaded }) {
+  const [cloudRecords, setCloudRecords] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+
+  const showMsg = (m, ms=4000) => { setMsg(m); setTimeout(() => setMsg(""), ms); };
+
+  const fetchCloud = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/history?select=race_id,data,updated_at&order=updated_at.desc`, { headers: sbHeaders });
+      if (!res.ok) throw new Error(await res.text());
+      const rows = await res.json();
+      setCloudRecords(rows);
+      showMsg(`✓ ${rows.length}件 取得`);
+    } catch(e) { showMsg("✗ 取得失敗: " + e.message); }
+    setLoading(false);
+  };
+
+  useEffect(() => { fetchCloud(); }, []);
+
+  const deleteCloud = async (raceId) => {
+    if (deleteConfirm !== raceId) {
+      setDeleteConfirm(raceId);
+      setTimeout(() => setDeleteConfirm(null), 3000);
+      return;
+    }
+    setLoading(true);
+    try {
+      await sbDeleteHistory(raceId);
+      setCloudRecords(prev => prev.filter(r => r.race_id !== raceId));
+      showMsg("✓ 削除しました");
+    } catch(e) { showMsg("✗ 削除失敗: " + e.message); }
+    setLoading(false);
+    setDeleteConfirm(null);
+  };
+
+  const loadToApp = () => {
+    if (!cloudRecords) return;
+    const data = cloudRecords.map(r => r.data);
+    const merged = [...data];
+    history.forEach(h => { if (!merged.find(m => m.raceId === h.raceId)) merged.push(h); });
+    onHistoryLoaded(merged);
+    showMsg(`✓ ${data.length}件 アプリに読み込みました`);
+  };
+
+  const totalSize = cloudRecords ? JSON.stringify(cloudRecords).length : 0;
+
+  return (
+    <div style={S.page}>
+      <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ fontWeight: 700 }}>クラウドデータ管理</span>
+        <button style={S.btnSmall} onClick={fetchCloud} disabled={loading}>{loading ? "取得中..." : "↻ 更新"}</button>
+      </div>
+
+      {msg && <div style={{ fontSize: 12, padding: "6px 10px", border: "1px solid #ccc", background: "#f9f9f9", marginBottom: 10 }}>{msg}</div>}
+
+      {cloudRecords && (
+        <div style={{ ...S.card, marginBottom: 14 }}>
+          {[["保存レコード数", cloudRecords.length + "件"],
+            ["概算データ量", (totalSize/1024).toFixed(1) + " KB / 500 MB"],
+            ["アプリ内履歴", history.length + "件"]].map(([k,v]) => (
+            <div key={k} style={{ ...S.row, justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #eee" }}>
+              <span style={{ fontSize: 12, color: "#666" }}>{k}</span>
+              <span style={{ fontWeight: 600, fontSize: 13 }}>{v}</span>
+            </div>
+          ))}
+          <button style={{ ...S.btnSmallFill, marginTop: 10 }} onClick={loadToApp}>すべてアプリに読込</button>
+        </div>
+      )}
+
+      {cloudRecords && cloudRecords.length === 0 && (
+        <div style={{ color: "#888", fontSize: 13, textAlign: "center", padding: "20px 0" }}>
+          クラウドにデータはありません。予想タブで保存後、上部の「↑ 保存」を押すとここに表示されます。
+        </div>
+      )}
+
+      {cloudRecords && cloudRecords.map(r => {
+        const d = r.data || {};
+        const inApp = history.find(h => h.raceId === r.race_id);
+        return (
+          <div key={r.race_id} style={{ ...S.card, padding: "8px 12px" }}>
+            <div style={{ ...S.row, justifyContent: "space-between" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{d.raceName || r.race_id}</div>
+                <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>
+                  {d.raceDate} · {formatDate(r.updated_at)}
+                  {d.resultEntered && <span style={{ marginLeft: 6, border: "1px solid #999", padding: "0 4px" }}>結果済</span>}
+                  {inApp && <span style={{ marginLeft: 6, color: "#444" }}>● アプリ内</span>}
+                </div>
+              </div>
+              <button style={S.btnSmall} onClick={() => deleteCloud(r.race_id)} disabled={loading}>
+                {deleteConfirm === r.race_id ? "確認" : "削除"}
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 // ============================================================
 // SUPABASE SYNC BAR
@@ -1000,7 +1388,7 @@ function SupabaseSyncBar({ history, onHistoryLoaded }) {
     setSyncing(true);
     try {
       await sbSaveHistory(history);
-      showMsg(`✓ ${history.length}件 保存しました`);
+      showMsg("✓ " + history.length + "件 保存しました");
     } catch(e) { showMsg("✗ 保存失敗: " + e.message); }
     setSyncing(false);
   };
@@ -1014,7 +1402,7 @@ function SupabaseSyncBar({ history, onHistoryLoaded }) {
         const merged = [...data];
         history.forEach(h => { if (!merged.find(m => m.raceId === h.raceId)) merged.push(h); });
         onHistoryLoaded(merged);
-        showMsg(`✓ ${data.length}件 読み込みました`);
+        showMsg("✓ " + data.length + "件 読み込みました");
       }
     } catch(e) { showMsg("✗ 読込失敗: " + e.message); }
     setSyncing(false);
@@ -1052,7 +1440,7 @@ function App() {
     saveStorage(STORAGE_KEYS.history, h);
   };
 
-  const tabLabels = ["予想", "分析設定", "履歴", "累積分析"];
+  const tabLabels = ["予想", "設定", "履歴", "分析", "データ"];
 
   return (
     <div style={S.app}>
@@ -1067,6 +1455,7 @@ function App() {
       {tab === 1 && <SettingsTab modules={modules} setModules={setModules} />}
       {tab === 2 && <HistoryTab modules={modules} history={history} setHistory={handleSetHistory} />}
       {tab === 3 && <AccumulationTab history={history} />}
+      {tab === 4 && <DataTab history={history} onHistoryLoaded={handleSetHistory} />}
     </div>
   );
 }
