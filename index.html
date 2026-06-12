@@ -602,6 +602,8 @@ function PredictionTab({ modules, history, setHistory }) {
     setRaces(prev => prev.map(r => ready.find(x => x.key === r.key) ? { ...r, saved: true } : r));
     setError("");
     setOverwriteConfirm(false);
+    // Auto-sync to Supabase
+    sbSaveHistory(updated).catch(() => {});
   };
 
   const saveOne = (key) => {
@@ -615,6 +617,8 @@ function PredictionTab({ modules, history, setHistory }) {
     setHistory(updated);
     saveStorage(STORAGE_KEYS.history, updated);
     setRaces(prev => prev.map(x => x.key === key ? { ...x, saved: true } : x));
+    // Auto-sync to Supabase
+    sbSaveHistory(updated).catch(() => {});
   };
 
   const removeRace = (key) => {
@@ -930,6 +934,8 @@ function HistoryTab({ modules, history, setHistory }) {
     setHistory(updated);
     saveStorage(STORAGE_KEYS.history, updated);
     setDeleteConfirm(null);
+    // Auto-sync: delete from Supabase
+    sbDeleteHistory(raceId).catch(() => {});
   };
 
   const exportAll = () => {
@@ -983,6 +989,8 @@ function HistoryTab({ modules, history, setHistory }) {
     const race = history.find(h => h.raceId === raceId);
     setResultMsg(`✓ 「${race?.raceName}」に結果を反映しました（${sorted.length}頭）`);
     setResultText("");
+    // Auto-sync to Supabase
+    sbSaveHistory(updated).catch(() => {});
   };
 
   const importResultFile = (e) => {
@@ -1388,7 +1396,7 @@ function SupabaseSyncBar({ history, onHistoryLoaded }) {
     setSyncing(true);
     try {
       await sbSaveHistory(history);
-      showMsg("✓ " + history.length + "件 保存しました");
+      showMsg("✓ " + history.length + "件 全件同期しました");
     } catch(e) { showMsg("✗ 保存失敗: " + e.message); }
     setSyncing(false);
   };
@@ -1410,9 +1418,10 @@ function SupabaseSyncBar({ history, onHistoryLoaded }) {
 
   return (
     <div style={{ borderBottom:"1px solid #eee", padding:"6px 16px", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", background:"#fafafa" }}>
-      <span style={{ fontSize:11, color:"#666" }}>クラウド:</span>
+      <span style={{ fontSize:11, color:"#888" }}>自動保存ON</span>
+      <span style={{ fontSize:11, color:"#ccc" }}>|</span>
       <button style={{ padding:"4px 10px", border:"1px solid #111", background:"#fff", fontSize:12, cursor:"pointer" }} onClick={pull} disabled={syncing}>↓ 読込</button>
-      <button style={{ padding:"4px 10px", border:"none", background:"#111", color:"#fff", fontSize:12, cursor:"pointer" }} onClick={push} disabled={syncing}>↑ 保存</button>
+      <button style={{ padding:"4px 10px", border:"1px solid #ccc", background:"#fff", fontSize:11, cursor:"pointer", color:"#666" }} onClick={push} disabled={syncing}>↑ 全件同期</button>
       {syncing && <span style={{ fontSize:11, color:"#888" }}>処理中...</span>}
       {msg && <span style={{ fontSize:11, color:"#333" }}>{msg}</span>}
     </div>
