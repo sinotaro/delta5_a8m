@@ -195,37 +195,64 @@ function parseCSV(text) {
   return { headers, rows };
 }
 
-// 統一入力: CSV(手動投入) と JV-Link JSON(racecards.data) の両対応
-// JSONの場合は entries + history(直近4走) をフラットな行に変換し、
-// CSVと同じ日本語キー(馬番/馬名/騎手/オッズ/人気/前走着順...)で分析モジュールに渡す
+// JV-VAN由来のracecard.dataを、分析モジュール用の日本語キー行に変換。
+// レース項目・出走馬項目・前走〜4走前の全項目を変数として展開する。
 function parseRacecard(rc) {
-  if (rc.data && rc.data.entries && rc.data.entries.length) {
-    const hist = rc.data.history || [];
-    const rows = rc.data.entries.map(e => {
-      const row = {
-        "馬番": e.number, "枠番": e.frame, "馬名": e.horse_name,
-        "性別": e.sex, "馬齢": e.age, "騎手": e.jockey, "調教師": e.trainer,
-        "斤量": e.weight, "馬体重": e.horse_weight,
-        "オッズ": e.odds, "人気": e.popularity, "PR": e.PR,
-      };
-      const past = hist.filter(h => h.horse_id === e.horse_id)
-                       .sort((a, b) => (b.race_id || "").localeCompare(a.race_id || ""));
-      const labels = ["前走", "2走前", "3走前", "4走前"];
-      labels.forEach((lb, i) => {
-        const p = past[i];
-        row[lb + "着順"] = p ? p.finish : "";
-        row[lb + "人気"] = p ? p.popularity : "";
-        row[lb + "オッズ"] = p ? p.odds : "";
-        row[lb + "上がり"] = p ? p.last3f : "";
-        row[lb + "距離"] = p ? p.distance : "";
-        row[lb + "頭数"] = p ? p.head_count : "";
-      });
-      return row;
+  if (!rc.data || !rc.data.entries || !rc.data.entries.length) return null;
+  const R = rc.data.race || {};
+  const hist = rc.data.history || [];
+  const rows = rc.data.entries.map(e => {
+    const row = {
+      // レース共通（各馬行にも持たせて式から参照可能に）
+      "開催日": R.date, "開催場": R.course, "曜日": R.youbi, "発走時刻": R.start_time,
+      "レース名": R.race_name, "グレード": R.grade, "条件": R.shubetsu,
+      "クラス": R.joken_name, "斤量条件": R.weight_type,
+      "コース種別": R.surface, "距離": R.distance, "回り": R.turn,
+      "馬場状態": R.condition, "天候": R.weather,
+      "本賞金1着": R.prize1, "本賞金2着": R.prize2, "本賞金3着": R.prize3,
+      // 出走馬
+      "枠番": e.frame, "馬番": e.number, "馬名": e.horse_name,
+      "性別": e.sex, "年齢": e.age, "毛色": e.keiro,
+      "騎手": e.jockey, "調教師": e.trainer, "所属": e.tozai, "馬主": e.owner,
+      "斤量": e.weight, "馬体重": e.horse_weight, "馬体重増減": e.horse_weight_diff,
+      "ブリンカー": e.blinker ? 1 : 0,
+      "オッズ": e.odds, "人気": e.popularity, "PR": e.PR,
+      // 当該レース結果（確定後のみ）
+      "着順": e.finish, "タイム": e.race_time, "上がり3F": e.last3f, "上がり4F": e.last4f,
+      "1C": e.pass1c, "2C": e.pass2c, "3C": e.pass3c, "4C": e.pass4c,
+      "獲得賞金": e.prize, "着差": e.chakusa,
+    };
+    // 前走〜4走前の全項目
+    const past = hist.filter(h => h.horse_id === e.horse_id)
+                     .sort((a, b) => (b.race_id || "").localeCompare(a.race_id || ""));
+    const labels = ["前走", "2走前", "3走前", "4走前"];
+    labels.forEach((lb, i) => {
+      const p = past[i] || {};
+      row[lb + "日付"] = p.date || "";
+      row[lb + "競馬場"] = p.course || "";
+      row[lb + "レース名"] = p.race_name || "";
+      row[lb + "格"] = p.grade || "";
+      row[lb + "着順"] = p.finish ?? "";
+      row[lb + "頭数"] = p.head_count ?? "";
+      row[lb + "馬番"] = p.horse_no ?? "";
+      row[lb + "人気"] = p.popularity ?? "";
+      row[lb + "騎手"] = p.jockey || "";
+      row[lb + "斤量"] = p.weight ?? "";
+      row[lb + "距離"] = p.distance ?? "";
+      row[lb + "馬場種別"] = p.surface || "";
+      row[lb + "回り"] = p.turn || "";
+      row[lb + "タイム"] = p.time || "";
+      row[lb + "馬場状態"] = p.condition || "";
+      row[lb + "馬体重"] = p.horse_weight ?? "";
+      row[lb + "通過順"] = p.pass || "";
+      row[lb + "上がり3F"] = p.last3f ?? "";
+      row[lb + "オッズ"] = p.odds ?? "";
+      row[lb + "相手馬"] = p.rival || "";
+      row[lb + "着差"] = p.chakusa || "";
     });
-    return { headers: Object.keys(rows[0] || {}), rows };
-  }
-  if (rc.csv) return parseRacecard(rc);
-  return null;
+    return row;
+  });
+  return { headers: Object.keys(rows[0] || {}), rows };
 }
 
 function toNum(v) {
@@ -514,10 +541,16 @@ function buildRacecards(races, entries) {
         history.push({
           horse_id: e.horse_id, race_id: p.race_id,
           race_name: pr.race_name || "", grade: pr.grade || "",
+          date: pr.race_date || "", course: pr.course || "",
           finish: p.finish, head_count: pr.head_count,
-          distance: pr.distance, surface: pr.surface || "",
+          horse_no: p.horse_no, distance: pr.distance, surface: pr.surface || "",
+          turn: pr.turn || "", condition: pr.condition || "",
           time: p.race_time || "", last3f: p.last3f,
           popularity: p.popularity, odds: p.odds,
+          jockey: p.jockey || "", weight: p.weight,
+          horse_weight: p.horse_weight, time_diff: p.time_diff,
+          pass: [p.pass1c, p.pass2c, p.pass3c, p.pass4c].filter(x => x != null).join("-"),
+          chakusa: p.chakusa || "", rival: p.rival_horse || "",
         });
       });
     });
@@ -527,18 +560,28 @@ function buildRacecards(races, entries) {
       data: {
         race: {
           race_id: r.race_id, race_name: r.race_name, date: r.race_date,
-          course: r.course, distance: r.distance, surface: r.surface,
-          condition: r.condition, grade: r.grade,
+          youbi: r.youbi, start_time: r.start_time, course: r.course,
+          distance: r.distance, surface: r.surface, turn: r.turn,
+          condition: r.condition, weather: r.weather, grade: r.grade,
+          shubetsu: r.shubetsu, joken_name: r.joken_name, weight_type: r.weight_type,
+          prize1: r.prize1, prize2: r.prize2, prize3: r.prize3,
+          first3f: r.first3f, last3f: r.last3f, lap_times: r.lap_times,
         },
         entries: es.map(e => ({
           horse_id: e.horse_id, horse_name: e.horse_name,
           frame: e.frame_no, number: e.horse_no, sex: e.sex, age: e.age,
-          jockey: e.jockey, trainer: e.trainer, weight: e.weight,
-          horse_weight: e.horse_weight, odds: e.odds, popularity: e.popularity,
+          keiro: e.keiro, jockey: e.jockey, trainer: e.trainer,
+          tozai: e.tozai, owner: e.owner, weight: e.weight,
+          horse_weight: e.horse_weight, horse_weight_diff: e.horse_weight_diff,
+          blinker: e.blinker, odds: e.odds, popularity: e.popularity,
+          // 結果（着順済みレースなら入る）
+          finish: e.finish, race_time: e.race_time, last3f: e.last3f, last4f: e.last4f,
+          pass1c: e.pass1c, pass2c: e.pass2c, pass3c: e.pass3c, pass4c: e.pass4c,
+          prize: e.prize, time_diff: e.time_diff, chakusa: e.chakusa,
+          ijyo: e.ijyo, rival_horse: e.rival_horse,
         })),
         history,
       },
-      // 結果（着順が入っていれば results 相当を内包）
       _result: (() => {
         const fin = es.filter(e => e.finish != null).sort((a, b) => a.finish - b.finish);
         if (!fin.length) return null;
@@ -640,65 +683,14 @@ function FormulaBuilder({ formula, onChange, modules, currentId }) {
 // TAB 1: 予想
 // ============================================================
 function RacesTab({ modules, racecards, results, predictions, refresh, busy, setBusy }) {
-  const [csvText, setCsvText] = useState("");
   const [error, setError] = useState("");
   const [msg, setMsg] = useState("");
   const [openRace, setOpenRace] = useState(null);
-  const [sortKey, setSortKey] = useState("date_desc"); // date_desc | date_asc | name
-  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [sortKey, setSortKey] = useState("date_desc");
   const [expanded, setExpanded] = useState({});
+  const [search, setSearch] = useState("");
 
   const showMsg = (m, ms=3000) => { setMsg(m); setTimeout(() => setMsg(""), ms); };
-
-  const makeRacecard = (text) => {
-    const parsed = parseCSV(text);
-    if (!parsed) return null;
-    const first = parsed.rows[0] || {};
-    const raceId = first.race_id || first.RaceID || first["レースID"] ||
-      ((first["開催日"] || "") + "_" + (first["開催場"] || "") + "_" + (first["レース番号"] || ""));
-    return {
-      race_id: raceId,
-      race_name: first.race_name || first["レース名"] || "—",
-      race_date: first.race_date || first["開催日"] || "—",
-      place: first.place || first["開催場"] || "—",
-      head_count: parsed.rows.length,
-      csv: text,
-    };
-  };
-
-  const uploadText = async () => {
-    if (!csvText.trim()) { setError("CSVを入力してください"); return; }
-    const rc = makeRacecard(csvText);
-    if (!rc) { setError("CSVの形式が正しくありません"); return; }
-    setError(""); setBusy(true);
-    try {
-      await db.saveRacecard(rc);
-      setCsvText("");
-      await refresh();
-      showMsg(`✓ 「${rc.race_name}」をDBに登録しました`);
-    } catch(e) { setError("✗ 登録失敗: " + e.message); }
-    setBusy(false);
-  };
-
-  const uploadFiles = async (e) => {
-    const files = Array.from(e.target.files);
-    e.target.value = "";
-    if (files.length === 0) return;
-    setBusy(true); setError("");
-    const cards = [];
-    await Promise.all(files.map(file => new Promise(res => {
-      const reader = new FileReader();
-      reader.onload = ev => { const rc = makeRacecard(ev.target.result); if (rc) cards.push(rc); res(); };
-      reader.onerror = () => res();
-      reader.readAsText(file, "utf-8");
-    })));
-    try {
-      if (cards.length > 0) await sbUpsert("racecards", cards);
-      await refresh();
-      showMsg(`✓ ${cards.length}/${files.length}件 DBに登録しました`);
-    } catch(e) { setError("✗ 登録失敗: " + e.message); }
-    setBusy(false);
-  };
 
   const buildPredData = (parsed) => {
     const res = runAnalysis(parsed, modules);
@@ -744,32 +736,17 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
     setBusy(false);
   };
 
-  const deleteRace = async (raceId) => {
-    if (deleteConfirm !== raceId) {
-      setDeleteConfirm(raceId);
-      setTimeout(() => setDeleteConfirm(null), 3000);
-      return;
-    }
-    setBusy(true);
-    try {
-      await db.deleteRacecard(raceId);
-      await refresh();
-      showMsg("✓ 出馬表・結果・分析を削除しました");
-    } catch(e) { showMsg("✗ 削除失敗: " + e.message); }
-    setBusy(false);
-    setDeleteConfirm(null);
-    if (openRace === raceId) setOpenRace(null);
-  };
-
-  const sorted = [...racecards].sort((a, b) => {
-    if (sortKey === "name") return (a.race_name || "").localeCompare(b.race_name || "", "ja");
-    if (sortKey === "date_asc") return (a.race_date || "").localeCompare(b.race_date || "");
-    return (b.created_at || "").localeCompare(a.created_at || "");
-  });
+  const sorted = [...racecards]
+    .filter(rc => !search || (rc.race_name || "").includes(search) || (rc.place || "").includes(search) || (rc.race_date || "").includes(search))
+    .sort((a, b) => {
+      if (sortKey === "name") return (a.race_name || "").localeCompare(b.race_name || "", "ja");
+      if (sortKey === "date_asc") return (a.race_date || "").localeCompare(b.race_date || "");
+      return (b.race_date || "").localeCompare(a.race_date || "");
+    });
 
   const predsFor = (raceId) => predictions.filter(p => p.race_id === raceId);
   const resultFor = (raceId) => results.find(r => r.race_id === raceId);
-  const [openVersion, setOpenVersion] = useState(null); // sig of expanded version
+  const [openVersion, setOpenVersion] = useState(null);
   const [delVerConfirm, setDelVerConfirm] = useState(null);
 
   const deleteVersion = async (raceId, sig) => {
@@ -792,15 +769,12 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
   return (
     <div style={S.page}>
       <div style={S.section}>
-        <label style={S.label}>出馬表CSVをDBに登録</label>
-        <textarea style={{ ...S.textarea, minHeight: 70 }} value={csvText} onChange={e => setCsvText(e.target.value)} placeholder={"開催日,開催場,...\n2026年5月31日,東京,..."} />
-        <div style={{ ...S.row, gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-          <button style={S.btn} onClick={uploadText} disabled={busy}>テキストから登録</button>
-          <label style={{ ...S.btn, display: "inline-block", opacity: busy ? 0.5 : 1 }}>
-            ファイル選択（複数可）
-            <input type="file" accept=".csv" multiple style={{ display: "none" }} onChange={uploadFiles} disabled={busy} />
-          </label>
+        <div style={{ fontSize: 12, color: "#555", lineHeight: 1.6 }}>
+          レースデータは JRA-VAN（JV-Link）から自動取得されたものです。
+          PCのバッチ(main.py)を実行するとSupabaseに追加され、ここに反映されます。
         </div>
+        <input style={{ ...S.input, marginTop: 8 }} value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="レース名・開催場・日付で検索" />
       </div>
 
       {error && <div style={S.error}>{error}</div>}
@@ -849,9 +823,6 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
                 <div style={{ ...S.row, gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
                   <button style={S.btnSmallFill} onClick={() => runPredict(rc)} disabled={busy}>
                     {preds.find(p => p.config_sig === currentSig) ? "現設定で再分析" : "現設定で分析"}
-                  </button>
-                  <button style={S.btnSmall} onClick={() => deleteRace(rc.race_id)} disabled={busy}>
-                    {deleteConfirm === rc.race_id ? "もう一度押して削除" : "レース削除"}
                   </button>
                 </div>
 
@@ -1079,174 +1050,70 @@ function ModuleEditor({ mod, onChange, modules, onSave, onCancel }) {
 // TAB 3: 履歴
 // ============================================================
 function ResultsTab({ racecards, results, predictions, refresh, busy, setBusy }) {
-  const [resultText, setResultText] = useState("");
-  const [msg, setMsg] = useState("");
-  const [bulkLog, setBulkLog] = useState([]);
-  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [openRace, setOpenRace] = useState(null);
+  const [search, setSearch] = useState("");
 
-  const showMsg = (m, ms=4000) => { setMsg(m); setTimeout(() => setMsg(""), ms); };
+  // 結果は entries の着順から自動生成済み（results配列）。レース情報と結合して表示。
+  const withResult = racecards
+    .filter(rc => results.find(r => r.race_id === rc.race_id))
+    .filter(rc => !search || (rc.race_name || "").includes(search) || (rc.place || "").includes(search) || (rc.race_date || "").includes(search))
+    .sort((a, b) => (b.race_date || "").localeCompare(a.race_date || ""));
 
-  // Match a result order against racecards (using predictions horse names, or csv parse)
-  const matchToRacecard = (order, meta) => {
-    const names = new Set(order.map(o => o.horseName));
-    let best = null, bestScore = -1;
-    racecards.forEach(rc => {
-      let horseNames = [];
-      const pred = predictions.find(p => p.race_id === rc.race_id);
-      if (pred) horseNames = pred.data.predictions.map(p => p.horseName);
-      else {
-        const parsed = parseRacecard(rc);
-        if (parsed) horseNames = parsed.rows.map(r => r["馬名"] || r.horse_name || "");
-      }
-      const overlap = horseNames.filter(n => names.has(n)).length;
-      const nameScore = overlap / Math.max(names.size, 1);
-      let metaScore = 0;
-      if (meta) {
-        if (meta.date && rc.race_date && rc.race_date.includes(meta.date)) metaScore += 0.5;
-        if (meta.raceName && rc.race_name && rc.race_name.includes(meta.raceName)) metaScore += 0.5;
-      }
-      const total = nameScore + metaScore;
-      if (total > bestScore) { bestScore = total; best = { rc, overlap, total: names.size }; }
-    });
-    if (best && best.overlap >= Math.max(3, best.total * 0.5)) return best.rc;
-    return null;
-  };
-
-  const applyResult = async (text) => {
-    const order = parseResultData(text);
-    if (!order) return { ok: false, reason: "解析失敗" };
-    const meta = extractResultMeta(text);
-    const rc = matchToRacecard(order, meta);
-    if (!rc) return { ok: false, reason: "対応する出馬表なし" };
-    const sorted = [...order].sort((a, b) => a.finishRank - b.finishRank);
-    const data = {
-      first: sorted[0]?.horseName || "",
-      second: sorted[1]?.horseName || "",
-      third: sorted[2]?.horseName || "",
-      order: sorted,
-    };
-    try {
-      await db.saveResult(rc.race_id, data);
-      return { ok: true, raceName: rc.race_name, count: sorted.length };
-    } catch(e) {
-      return { ok: false, reason: "DB保存失敗" };
-    }
-  };
-
-  const importText = async () => {
-    setBusy(true);
-    const r = await applyResult(resultText);
-    if (r.ok) {
-      await refresh();
-      showMsg(`✓ 「${r.raceName}」に結果を紐付けました（${r.count}頭）`);
-      setResultText("");
-    } else {
-      showMsg("✗ " + r.reason);
-    }
-    setBusy(false);
-  };
-
-  const importFiles = async (e) => {
-    const files = Array.from(e.target.files);
-    e.target.value = "";
-    if (files.length === 0) return;
-    setBusy(true);
-    setBulkLog([]);
-    const texts = await Promise.all(files.map(file => new Promise(res => {
-      const reader = new FileReader();
-      reader.onload = ev => res({ name: file.name, text: ev.target.result });
-      reader.onerror = () => res({ name: file.name, text: "" });
-      reader.readAsText(file, "utf-8");
-    })));
-    const log = [];
-    for (const { name, text } of texts) {
-      const r = await applyResult(text);
-      log.push({ name, ...r });
-    }
-    await refresh();
-    setBulkLog(log);
-    const ok = log.filter(l => l.ok).length;
-    showMsg(`✓ ${ok}/${files.length}件 紐付けました`);
-    setBusy(false);
-  };
-
-  const deleteOne = async (raceId) => {
-    if (deleteConfirm !== raceId) {
-      setDeleteConfirm(raceId);
-      setTimeout(() => setDeleteConfirm(null), 3000);
-      return;
-    }
-    setBusy(true);
-    try {
-      await db.deleteResult(raceId);
-      await refresh();
-      showMsg("✓ 結果を削除しました");
-    } catch(e) { showMsg("✗ 削除失敗"); }
-    setBusy(false);
-    setDeleteConfirm(null);
-  };
-
-  const rcFor = (raceId) => racecards.find(r => r.race_id === raceId);
+  const resultFor = (raceId) => results.find(r => r.race_id === raceId);
 
   return (
     <div style={S.page}>
-      <div style={{ ...S.card, marginBottom: 14 }}>
-        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>結果をDBに登録（自動紐付け）</div>
-        <div style={{ fontSize: 11, color: "#888", marginBottom: 8 }}>
-          結果CSV（着順・馬番・馬名）またはJRA結果テキスト。馬名＋開催日で出馬表に自動で紐付きます。
+      <div style={S.section}>
+        <div style={{ fontSize: 12, color: "#555", lineHeight: 1.6 }}>
+          着順・タイム・払戻はJRA-VANの確定成績から自動表示されます（手動入力は不要）。
         </div>
-        <label style={{ ...S.btnSmallFill, display: "inline-block", marginBottom: 8, opacity: busy ? 0.5 : 1 }}>
-          ファイル選択（複数可）
-          <input type="file" accept=".csv,.txt" multiple style={{ display: "none" }} onChange={importFiles} disabled={busy} />
-        </label>
-        {bulkLog.length > 0 && (
-          <div style={{ border: "1px solid #eee", marginBottom: 8 }}>
-            {bulkLog.map((l, i) => (
-              <div key={i} style={{ ...S.row, justifyContent: "space-between", padding: "5px 10px", borderBottom: "1px solid #f5f5f5", fontSize: 11 }}>
-                <span style={{ color: "#666", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.name}</span>
-                {l.ok
-                  ? <span style={{ whiteSpace: "nowrap", marginLeft: 8 }}>✓ {l.raceName}（{l.count}頭）</span>
-                  : <span style={{ color: "#999", whiteSpace: "nowrap", marginLeft: 8 }}>✗ {l.reason}</span>}
-              </div>
-            ))}
-          </div>
-        )}
-        <div style={S.divider} />
-        <textarea style={{ ...S.textarea, minHeight: 70 }} value={resultText} onChange={e => setResultText(e.target.value)}
-          placeholder={"着順,馬番,馬名\n1,17,ロブチェン\n..."} />
-        <button style={{ ...S.btnSmall, marginTop: 6 }} onClick={importText} disabled={busy}>テキストから登録</button>
-        {msg && <div style={{ fontSize: 12, marginTop: 8, padding: "6px 10px", border: "1px solid #ccc", background: "#f9f9f9" }}>{msg}</div>}
+        <input style={{ ...S.input, marginTop: 8 }} value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="レース名・開催場・日付で検索" />
       </div>
 
-      <div style={{ fontWeight: 700, marginBottom: 10 }}>結果一覧 ({results.length}件)</div>
-      {results.length === 0 && (
-        <div style={{ color: "#888", fontSize: 13, textAlign: "center", padding: "20px 0" }}>DBに結果がありません</div>
+      <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontWeight: 700 }}>結果あり ({withResult.length}件)</span>
+      </div>
+
+      {withResult.length === 0 && (
+        <div style={{ fontSize: 12, color: "#888", padding: 20, textAlign: "center" }}>
+          確定着順のあるレースがまだありません。<br/>
+          過去レース（成績確定済み）を取得すると表示されます。
+        </div>
       )}
-      {results.map(r => {
-        const rc = rcFor(r.race_id);
-        const top3 = r.data.order ? r.data.order.slice(0, 3) : [];
+
+      {withResult.map(rc => {
+        const result = resultFor(rc.race_id);
+        const isOpen = openRace === rc.race_id;
+        const order = (result?.data?.order) || [];
         return (
-          <div key={r.race_id} style={{ ...S.card, padding: "8px 12px" }}>
-            <div style={{ ...S.row, justifyContent: "space-between" }}>
+          <div key={rc.race_id} style={{ ...S.card, padding: 0, marginBottom: 8 }}>
+            <div style={{ padding: "10px 12px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
+              onClick={() => setOpenRace(isOpen ? null : rc.race_id)}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 13 }}>{rc ? rc.race_name : r.race_id}</div>
-                <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>
-                  {rc?.race_date} {!rc && <span style={{ color: "#999" }}>（出馬表なし）</span>}
-                </div>
-                <div style={{ fontSize: 11, color: "#444", marginTop: 4 }}>
-                  {top3.map(o => `${o.finishRank}着 ${o.horseName}`).join(" / ")}
-                </div>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{rc.race_name}</div>
+                <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{rc.race_date} · {rc.place} · {order.length}頭立</div>
               </div>
-              <button style={S.btnSmall} onClick={() => deleteOne(r.race_id)} disabled={busy}>
-                {deleteConfirm === r.race_id ? "確認" : "削除"}
-              </button>
+              <span style={{ fontSize: 11, color: "#999" }}>{isOpen ? "▲" : "▼"}</span>
             </div>
+            {isOpen && (
+              <div style={{ borderTop: "1px solid #eee", padding: "8px 12px" }}>
+                {order.map((o, i) => (
+                  <div key={i} style={{ ...S.row, padding: "4px 0", borderBottom: "1px solid #f3f3f3", fontSize: 12 }}>
+                    <span style={{ width: 36, fontWeight: 700 }}>{o.finishRank}着</span>
+                    <span style={{ width: 30 }}>{o.horseNumber}</span>
+                    <span style={{ flex: 1 }}>{o.horseName}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         );
       })}
     </div>
   );
 }
+
 
 function AccumulationTab({ racecards, results, predictions }) {
   // Join: for each prediction that has a matching result
@@ -1414,9 +1281,13 @@ function App() {
 
   const refresh = async () => {
     try {
-      const [rc, rs, pd] = await Promise.all([db.loadRacecards(), db.loadResults(), db.loadPredictions()]);
-      setRacecards(rc);
-      setResults(rs);
+      const [races, entries, pd] = await Promise.all([
+        db.loadRaces(), db.loadEntries(), db.loadPredictions(),
+      ]);
+      const cards = buildRacecards(races, entries);
+      setRacecards(cards);
+      // results は entries の着順から導出（_resultを持つレースだけ）
+      setResults(cards.filter(c => c._result).map(c => ({ race_id: c.race_id, data: c._result })));
       setPredictions(pd);
       setLastSync(new Date());
       setLoadError("");
