@@ -195,6 +195,39 @@ function parseCSV(text) {
   return { headers, rows };
 }
 
+// 統一入力: CSV(手動投入) と JV-Link JSON(racecards.data) の両対応
+// JSONの場合は entries + history(直近4走) をフラットな行に変換し、
+// CSVと同じ日本語キー(馬番/馬名/騎手/オッズ/人気/前走着順...)で分析モジュールに渡す
+function parseRacecard(rc) {
+  if (rc.data && rc.data.entries && rc.data.entries.length) {
+    const hist = rc.data.history || [];
+    const rows = rc.data.entries.map(e => {
+      const row = {
+        "馬番": e.number, "枠番": e.frame, "馬名": e.horse_name,
+        "性別": e.sex, "馬齢": e.age, "騎手": e.jockey, "調教師": e.trainer,
+        "斤量": e.weight, "馬体重": e.horse_weight,
+        "オッズ": e.odds, "人気": e.popularity, "PR": e.PR,
+      };
+      const past = hist.filter(h => h.horse_id === e.horse_id)
+                       .sort((a, b) => (b.race_id || "").localeCompare(a.race_id || ""));
+      const labels = ["前走", "2走前", "3走前", "4走前"];
+      labels.forEach((lb, i) => {
+        const p = past[i];
+        row[lb + "着順"] = p ? p.finish : "";
+        row[lb + "人気"] = p ? p.popularity : "";
+        row[lb + "オッズ"] = p ? p.odds : "";
+        row[lb + "上がり"] = p ? p.last3f : "";
+        row[lb + "距離"] = p ? p.distance : "";
+        row[lb + "頭数"] = p ? p.head_count : "";
+      });
+      return row;
+    });
+    return { headers: Object.keys(rows[0] || {}), rows };
+  }
+  if (rc.csv) return parseRacecard(rc);
+  return null;
+}
+
 function toNum(v) {
   if (v === undefined || v === null || v === "" || v === "無" || v === "-") return 0;
   const n = Number(v);
@@ -370,7 +403,10 @@ function moduleSignature(h) {
 }
 
 // ============================================================
-// SUPABASE STORAGE (3-table: racecards / results / predictions)
+// SUPABASE STORAGE
+//   読み取り元: races / entries（JRA-VANバッチが投入した正規化テーブル）
+//   書き込み先: predictions（分析結果のバージョン保存）
+//   ※CSV手動投入・racecards/resultsテーブルは廃止。JRA-VANに一本化。
 // ============================================================
 const SUPABASE_URL = "https://kxedmjixqswrdboqyupg.supabase.co";
 const SUPABASE_KEY = "sb_publishable_alXlqXjHEURfgg-cmP00VQ_1lt8FLAC";
@@ -395,8 +431,42 @@ async function sbFetch(table, query = "") {
   return res.json();
 }
 
-async function sbUpsert(table, rows) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+// ページング取得（1000件超のentries対策）
+async function sbFetchAll(table, query = "") {
+  const all = [];
+  const pageSize = 1000;
+  for (let from = 0; ; from += pageSize) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}`, {
+      headers: { ...sbHeaders, "Range-Unit": "items", "Range": `${from}-${from + pageSize - 1}` },
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const rows = await res.json();
+    all.push(...rows);
+    if (rows.length < pageSize) break;
+  }
+  return all;
+}
+
+// Config signature: identifies a unique module configuration
+function configSignature(modules) {
+  const enabled = modules.filter(m => m.enabled)
+    .map(m => m.outputVar + "=" + m.formula.replace(/\s+/g, ""))
+    .sort()
+    .join("|");
+  let h = 0;
+  for (let i = 0; i < enabled.length; i++) {
+    h = ((h << 5) - h + enabled.charCodeAt(i)) | 0;
+  }
+  return "cfg_" + (h >>> 0).toString(16);
+}
+
+function configName(modules) {
+  return modules.filter(m => m.enabled).map(m => m.name).join(" + ");
+}
+
+// Upsert with composite key support (predictions)
+async function sbUpsertOn(table, rows, onConflict) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?on_conflict=${onConflict}`, {
     method: "POST",
     headers: { ...sbHeaders, "Prefer": "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify(rows),
@@ -404,25 +474,91 @@ async function sbUpsert(table, rows) {
   if (!res.ok) throw new Error(await res.text());
 }
 
-async function sbDelete(table, raceId) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?race_id=eq.${encodeURIComponent(raceId)}`, {
+async function sbDeletePrediction(raceId, sig) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/predictions?race_id=eq.${encodeURIComponent(raceId)}&config_sig=eq.${encodeURIComponent(sig)}`, {
     method: "DELETE",
     headers: sbHeaders,
   });
   if (!res.ok) throw new Error(await res.text());
 }
 
+// races+entries から、アプリが使う racecard 構造を組み立てる。
+//   各レース: { race_id, race_name, race_date, place, head_count,
+//              data: { race, entries[], history[] } }
+//   history は同一馬(horse_id)の過去走entries(着順あり・当該race_idより前)から最大4走。
+function buildRacecards(races, entries) {
+  // entries を race_id でグループ化
+  const byRace = {};
+  entries.forEach(e => {
+    (byRace[e.race_id] = byRace[e.race_id] || []).push(e);
+  });
+  // horse_id ごとの全走（着順あり）を時系列で
+  const byHorse = {};
+  entries.forEach(e => {
+    if (e.horse_id && e.finish != null) {
+      (byHorse[e.horse_id] = byHorse[e.horse_id] || []).push(e);
+    }
+  });
+  Object.values(byHorse).forEach(arr => arr.sort((a, b) => (b.race_id || "").localeCompare(a.race_id || "")));
+  const raceMap = {};
+  races.forEach(r => { raceMap[r.race_id] = r; });
+
+  return races.map(r => {
+    const es = (byRace[r.race_id] || []).slice().sort((a, b) => (a.horse_no || 0) - (b.horse_no || 0));
+    const history = [];
+    es.forEach(e => {
+      if (!e.horse_id) return;
+      const past = (byHorse[e.horse_id] || []).filter(p => (p.race_id || "") < r.race_id).slice(0, 4);
+      past.forEach(p => {
+        const pr = raceMap[p.race_id] || {};
+        history.push({
+          horse_id: e.horse_id, race_id: p.race_id,
+          race_name: pr.race_name || "", grade: pr.grade || "",
+          finish: p.finish, head_count: pr.head_count,
+          distance: pr.distance, surface: pr.surface || "",
+          time: p.race_time || "", last3f: p.last3f,
+          popularity: p.popularity, odds: p.odds,
+        });
+      });
+    });
+    return {
+      race_id: r.race_id, race_name: r.race_name, race_date: r.race_date,
+      place: r.course, head_count: r.head_count,
+      data: {
+        race: {
+          race_id: r.race_id, race_name: r.race_name, date: r.race_date,
+          course: r.course, distance: r.distance, surface: r.surface,
+          condition: r.condition, grade: r.grade,
+        },
+        entries: es.map(e => ({
+          horse_id: e.horse_id, horse_name: e.horse_name,
+          frame: e.frame_no, number: e.horse_no, sex: e.sex, age: e.age,
+          jockey: e.jockey, trainer: e.trainer, weight: e.weight,
+          horse_weight: e.horse_weight, odds: e.odds, popularity: e.popularity,
+        })),
+        history,
+      },
+      // 結果（着順が入っていれば results 相当を内包）
+      _result: (() => {
+        const fin = es.filter(e => e.finish != null).sort((a, b) => a.finish - b.finish);
+        if (!fin.length) return null;
+        return {
+          order: fin.map(e => ({ finishRank: e.finish, horseName: e.horse_name, horseNumber: e.horse_no })),
+          first: fin[0].horse_name,
+        };
+      })(),
+    };
+  });
+}
+
 // High-level API
 const db = {
-  loadRacecards: () => sbFetch("racecards", "select=*&order=created_at.desc"),
-  loadResults:   () => sbFetch("results", "select=*"),
-  loadPredictions: () => sbFetch("predictions", "select=*"),
-  saveRacecard:  (rc) => sbUpsert("racecards", [rc]),
-  saveResult:    (raceId, data) => sbUpsert("results", [{ race_id: raceId, data }]),
-  savePrediction:(raceId, data) => sbUpsert("predictions", [{ race_id: raceId, data }]),
-  deleteRacecard:(raceId) => Promise.all([sbDelete("racecards", raceId), sbDelete("results", raceId), sbDelete("predictions", raceId)]),
-  deleteResult:  (raceId) => sbDelete("results", raceId),
-  deletePrediction:(raceId) => sbDelete("predictions", raceId),
+  // JRA-VAN正規化テーブルから読む
+  loadRaces:   () => sbFetchAll("races", "select=*&order=race_date.desc"),
+  loadEntries: () => sbFetchAll("entries", "select=*"),
+  loadPredictions: () => sbFetch("predictions", "select=*&order=created_at.desc"),
+  savePrediction:(raceId, sig, name, data) => sbUpsertOn("predictions", [{ race_id: raceId, config_sig: sig, config_name: name, data }], "race_id,config_sig"),
+  deletePrediction: sbDeletePrediction,
 };
 
 // ============================================================
@@ -564,12 +700,9 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
     setBusy(false);
   };
 
-  const runPredict = async (rc) => {
-    const parsed = parseCSV(rc.csv);
-    if (!parsed) { showMsg("✗ CSV解析失敗"); return; }
-    setBusy(true);
+  const buildPredData = (parsed) => {
     const res = runAnalysis(parsed, modules);
-    const data = {
+    return {
       predictions: res.map(x => ({
         rank: x.rank,
         horseName: x.row["馬名"] || x.row.horse_name || "—",
@@ -580,36 +713,34 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
       modules: modules.filter(m => m.enabled).map(m => ({ name: m.name, outputVar: m.outputVar, formula: m.formula })),
       analyzedAt: new Date().toISOString(),
     };
+  };
+
+  const runPredict = async (rc) => {
+    const parsed = parseRacecard(rc);
+    if (!parsed) { showMsg("✗ CSV解析失敗"); return; }
+    setBusy(true);
+    const sig = configSignature(modules);
+    const name = configName(modules);
     try {
-      await db.savePrediction(rc.race_id, data);
+      await db.savePrediction(rc.race_id, sig, name, buildPredData(parsed));
       await refresh();
-      showMsg(`✓ 「${rc.race_name}」を分析しDBに保存しました`);
+      showMsg(`✓ 「${rc.race_name}」を現在の設定で分析しました`);
     } catch(e) { showMsg("✗ 保存失敗: " + e.message); }
     setBusy(false);
   };
 
   const predictAll = async () => {
     setBusy(true);
+    const sig = configSignature(modules);
+    const name = configName(modules);
     let ok = 0;
     for (const rc of racecards) {
-      const parsed = parseCSV(rc.csv);
+      const parsed = parseRacecard(rc);
       if (!parsed) continue;
-      const res = runAnalysis(parsed, modules);
-      const data = {
-        predictions: res.map(x => ({
-          rank: x.rank,
-          horseName: x.row["馬名"] || x.row.horse_name || "—",
-          horseNumber: x.row["馬番"] || x.row.horse_number || "—",
-          total: x.total,
-          moduleScores: x.moduleScores,
-        })),
-        modules: modules.filter(m => m.enabled).map(m => ({ name: m.name, outputVar: m.outputVar, formula: m.formula })),
-        analyzedAt: new Date().toISOString(),
-      };
-      try { await db.savePrediction(rc.race_id, data); ok++; } catch {}
+      try { await db.savePrediction(rc.race_id, sig, name, buildPredData(parsed)); ok++; } catch {}
     }
     await refresh();
-    showMsg(`✓ ${ok}件 一括分析しました`);
+    showMsg(`✓ ${ok}件 現在の設定で一括分析しました`);
     setBusy(false);
   };
 
@@ -636,8 +767,27 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
     return (b.created_at || "").localeCompare(a.created_at || "");
   });
 
-  const predFor = (raceId) => predictions.find(p => p.race_id === raceId);
+  const predsFor = (raceId) => predictions.filter(p => p.race_id === raceId);
   const resultFor = (raceId) => results.find(r => r.race_id === raceId);
+  const [openVersion, setOpenVersion] = useState(null); // sig of expanded version
+  const [delVerConfirm, setDelVerConfirm] = useState(null);
+
+  const deleteVersion = async (raceId, sig) => {
+    const key = raceId + sig;
+    if (delVerConfirm !== key) {
+      setDelVerConfirm(key);
+      setTimeout(() => setDelVerConfirm(null), 3000);
+      return;
+    }
+    setBusy(true);
+    try {
+      await db.deletePrediction(raceId, sig);
+      await refresh();
+      showMsg("✓ 分析バージョンを削除しました");
+    } catch(e) { showMsg("✗ 削除失敗"); }
+    setBusy(false);
+    setDelVerConfirm(null);
+  };
 
   return (
     <div style={S.page}>
@@ -675,9 +825,10 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
       )}
 
       {sorted.map(rc => {
-        const pred = predFor(rc.race_id);
+        const preds = predsFor(rc.race_id);
         const result = resultFor(rc.race_id);
         const isOpen = openRace === rc.race_id;
+        const currentSig = configSignature(modules);
         return (
           <div key={rc.race_id} style={{ ...S.card, padding: 0, marginBottom: 8 }}>
             <div style={{ padding: "10px 12px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}
@@ -687,7 +838,7 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
                 <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{rc.race_date} · {rc.place} · {rc.head_count}頭</div>
               </div>
               <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                {pred && <span style={{ fontSize: 10, border: "1px solid #111", padding: "1px 5px" }}>分析済</span>}
+                {preds.length > 0 && <span style={{ fontSize: 10, border: "1px solid #111", padding: "1px 5px" }}>分析{preds.length}版</span>}
                 {result && <span style={{ fontSize: 10, border: "1px solid #111", background: "#111", color: "#fff", padding: "1px 5px" }}>結果済</span>}
                 <span style={{ fontSize: 11, color: "#999" }}>{isOpen ? "▲" : "▼"}</span>
               </div>
@@ -696,47 +847,67 @@ function RacesTab({ modules, racecards, results, predictions, refresh, busy, set
             {isOpen && (
               <div style={{ borderTop: "1px solid #eee", padding: "10px 12px" }}>
                 <div style={{ ...S.row, gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                  <button style={S.btnSmallFill} onClick={() => runPredict(rc)} disabled={busy}>{pred ? "再分析" : "分析実行"}</button>
+                  <button style={S.btnSmallFill} onClick={() => runPredict(rc)} disabled={busy}>
+                    {preds.find(p => p.config_sig === currentSig) ? "現設定で再分析" : "現設定で分析"}
+                  </button>
                   <button style={S.btnSmall} onClick={() => deleteRace(rc.race_id)} disabled={busy}>
-                    {deleteConfirm === rc.race_id ? "もう一度押して削除" : "削除"}
+                    {deleteConfirm === rc.race_id ? "もう一度押して削除" : "レース削除"}
                   </button>
                 </div>
 
-                {pred && (
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 4 }}>
-                      予想順位
-                      <span style={{ fontWeight: 400, fontSize: 10, color: "#888", marginLeft: 8 }}>{formatDate(pred.data.analyzedAt)}</span>
-                    </div>
-                    {pred.data.predictions.map((p, i) => {
-                      const finish = result?.data?.order?.find(o => o.horseName === p.horseName);
-                      const k = rc.race_id + "-" + i;
-                      return (
-                        <div key={i}>
-                          <div style={{ ...S.row, padding: "5px 0", borderBottom: "1px solid #f3f3f3", fontSize: 12, cursor: "pointer" }}
-                            onClick={() => setExpanded(prev => ({ ...prev, [k]: !prev[k] }))}>
-                            <span style={{ width: 28, fontWeight: 700 }}>{p.rank}</span>
-                            <span style={{ width: 30 }}>{p.horseNumber}</span>
-                            <span style={{ flex: 1 }}>{p.horseName}</span>
-                            <span style={{ fontFamily: "monospace", width: 56, textAlign: "right" }}>{Number(p.total).toFixed(1)}</span>
-                            {finish && <span style={{ width: 50, textAlign: "right", fontSize: 11, fontWeight: 700 }}>{finish.finishRank}着</span>}
-                          </div>
-                          {expanded[k] && p.moduleScores && (
-                            <div style={{ background: "#f9f9f9", border: "1px solid #eee", padding: "6px 10px", fontSize: 11 }}>
-                              {Object.entries(p.moduleScores).map(([mk, mv]) => (
-                                <div key={mk} style={{ ...S.row, justifyContent: "space-between" }}>
-                                  <span style={{ color: "#555" }}>{mk}</span>
-                                  <span style={{ fontFamily: "monospace" }}>{Number(mv).toFixed(4)}</span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
+                {preds.length === 0 && <div style={{ fontSize: 12, color: "#888" }}>未分析。「現設定で分析」で予想します。設定を変えて分析すると別バージョンとして保存されます。</div>}
+
+                {preds.map(pred => {
+                  const sig = pred.config_sig;
+                  const isCurrent = sig === currentSig;
+                  const verOpen = openVersion === rc.race_id + sig;
+                  return (
+                    <div key={sig} style={{ border: "1px solid #ddd", marginBottom: 6 }}>
+                      <div style={{ padding: "7px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", background: isCurrent ? "#f5f5f5" : "#fff" }}
+                        onClick={() => setOpenVersion(verOpen ? null : rc.race_id + sig)}>
+                        <div style={{ flex: 1 }}>
+                          <span style={{ fontSize: 11, fontWeight: 600 }}>{pred.config_name || sig}</span>
+                          {isCurrent && <span style={{ fontSize: 9, border: "1px solid #111", padding: "0 4px", marginLeft: 6 }}>現在の設定</span>}
+                          <div style={{ fontSize: 10, color: "#999", marginTop: 1 }}>{formatDate(pred.data.analyzedAt)}</div>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-                {!pred && <div style={{ fontSize: 12, color: "#888" }}>未分析。「分析実行」で現在のモジュール設定で予想します。</div>}
+                        <span style={{ fontSize: 11, color: "#999" }}>{verOpen ? "▲" : "▼"}</span>
+                      </div>
+                      {verOpen && (
+                        <div style={{ borderTop: "1px solid #eee", padding: "8px 10px" }}>
+                          {pred.data.predictions.map((p, i) => {
+                            const finish = result?.data?.order?.find(o => o.horseName === p.horseName);
+                            const k = rc.race_id + sig + "-" + i;
+                            return (
+                              <div key={i}>
+                                <div style={{ ...S.row, padding: "4px 0", borderBottom: "1px solid #f3f3f3", fontSize: 12, cursor: "pointer" }}
+                                  onClick={() => setExpanded(prev => ({ ...prev, [k]: !prev[k] }))}>
+                                  <span style={{ width: 26, fontWeight: 700 }}>{p.rank}</span>
+                                  <span style={{ width: 28 }}>{p.horseNumber}</span>
+                                  <span style={{ flex: 1 }}>{p.horseName}</span>
+                                  <span style={{ fontFamily: "monospace", width: 54, textAlign: "right" }}>{Number(p.total).toFixed(1)}</span>
+                                  {finish && <span style={{ width: 44, textAlign: "right", fontSize: 11, fontWeight: 700 }}>{finish.finishRank}着</span>}
+                                </div>
+                                {expanded[k] && p.moduleScores && (
+                                  <div style={{ background: "#f9f9f9", border: "1px solid #eee", padding: "6px 10px", fontSize: 11 }}>
+                                    {Object.entries(p.moduleScores).map(([mk, mv]) => (
+                                      <div key={mk} style={{ ...S.row, justifyContent: "space-between" }}>
+                                        <span style={{ color: "#555" }}>{mk}</span>
+                                        <span style={{ fontFamily: "monospace" }}>{Number(mv).toFixed(4)}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                          <button style={{ ...S.btnSmall, marginTop: 6, fontSize: 11 }} onClick={() => deleteVersion(rc.race_id, sig)} disabled={busy}>
+                            {delVerConfirm === rc.race_id + sig ? "もう一度押して削除" : "このバージョンを削除"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -924,7 +1095,7 @@ function ResultsTab({ racecards, results, predictions, refresh, busy, setBusy })
       const pred = predictions.find(p => p.race_id === rc.race_id);
       if (pred) horseNames = pred.data.predictions.map(p => p.horseName);
       else {
-        const parsed = parseCSV(rc.csv);
+        const parsed = parseRacecard(rc);
         if (parsed) horseNames = parsed.rows.map(r => r["馬名"] || r.horse_name || "");
       }
       const overlap = horseNames.filter(n => names.has(n)).length;
@@ -1082,7 +1253,7 @@ function AccumulationTab({ racecards, results, predictions }) {
   const joined = predictions.map(p => {
     const result = results.find(r => r.race_id === p.race_id);
     const rc = racecards.find(r => r.race_id === p.race_id);
-    return { raceId: p.race_id, pred: p.data, result: result?.data, rc };
+    return { raceId: p.race_id, pred: p.data, configName: p.config_name, configSig: p.config_sig, result: result?.data, rc };
   }).filter(j => j.result);
 
   const enteredCount = joined.length;
@@ -1124,10 +1295,10 @@ function AccumulationTab({ racecards, results, predictions }) {
   const avgWinRank = winRanks.length > 0 ? (winRanks.reduce((a,b)=>a+b,0)/winRanks.length).toFixed(1) : "—";
   const avgCorr = correlations.length > 0 ? correlations.reduce((s,x)=>s+x.corr,0)/correlations.length : null;
 
-  // Group by module configuration
+  // Group by config version (sig + name)
   const groups = {};
   correlations.forEach(({ j, corr }) => {
-    const sig = (j.pred.modules || []).map(m => m.name).sort().join(" + ") || "不明";
+    const sig = j.configName || (j.pred.modules || []).map(m => m.name).sort().join(" + ") || "不明";
     if (!groups[sig]) groups[sig] = { corrs: [], wins: 0, races: 0 };
     groups[sig].corrs.push(corr);
     groups[sig].races++;
@@ -1137,7 +1308,7 @@ function AccumulationTab({ racecards, results, predictions }) {
 
   const stats = [
     ["出馬表数", racecards.length + "件"],
-    ["分析済み", predictions.length + "件"],
+    ["分析済み", new Set(predictions.map(p => p.race_id)).size + "レース / " + predictions.length + "版"],
     ["結果あり（分析×結果）", enteredCount + "件"],
     ["予想1位勝率", pct(pred1Win, enteredCount)],
     ["予想TOP3勝率", pct(pred3Win, enteredCount)],
@@ -1184,9 +1355,12 @@ function AccumulationTab({ racecards, results, predictions }) {
           <span style={{ fontSize: 13, color: "#444" }}>全体平均相関</span>
           <span style={{ fontWeight: 700, fontSize: 14, fontFamily: "monospace" }}>{corrLabel(avgCorr)}</span>
         </div>
-        {correlations.slice(0, 15).map(({ j, corr }) => (
-          <div key={j.raceId} style={{ ...S.row, justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #f3f3f3" }}>
-            <span style={{ fontSize: 12, color: "#666", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{j.rc?.race_name || j.raceId}</span>
+        {correlations.slice(0, 15).map(({ j, corr }, idx) => (
+          <div key={j.raceId + (j.configSig || "") + idx} style={{ ...S.row, justifyContent: "space-between", padding: "5px 0", borderBottom: "1px solid #f3f3f3" }}>
+            <span style={{ fontSize: 12, color: "#666", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {j.rc?.race_name || j.raceId}
+              {j.configName && <span style={{ fontSize: 10, color: "#aaa" }}>（{j.configName}）</span>}
+            </span>
             <span style={{ fontFamily: "monospace", fontSize: 13 }}>{corr.toFixed(3)}</span>
           </div>
         ))}
